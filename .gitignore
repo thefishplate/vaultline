@@ -1,0 +1,35 @@
+# Local, per-machine
+locals.txt
+
+# Working notes, drafts and todo lists.
+#
+# Markdown is ignored by DEFAULT and the tracked documents are listed
+# explicitly below. That way a new .md file is untracked unless it is named
+# here, so nothing is committed by forgetting a naming convention.
+*.md
+!README.md
+!CHANGELOG.md
+!CONTRIBUTING.md
+!SPEC.md
+!TODO.md
+
+scratch/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Vaults, and anything that looks like one. Belt and braces: the whole point
+# of the format is that the ciphertext is safe to hold, but nothing in this
+# repository should ever contain a real one.
+*.vaultline
+*.gpg
+*.asc
+*.kdbx
+
+# Build artefacts
+build/
+dist/
+*.egg-info/

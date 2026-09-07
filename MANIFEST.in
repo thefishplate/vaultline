@@ -1,0 +1,10 @@
+# The wheel ships only vaultline.py (see [tool.setuptools] py-modules).
+# The sdist carries more: downstream packagers build from it and are expected
+# to be able to run the tests, and the documents below are what make the
+# claims in the README checkable.
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SPEC.md
+include vaultline_dev.py
+
+prune scratch

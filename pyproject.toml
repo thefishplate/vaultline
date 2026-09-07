@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vaultline"
+version = "0.0.1"
+description = "A credential store whose ciphertext is safe to publish, and whose access can be re-wrapped without re-encrypting anything"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "the vaultline contributors" }]
+keywords = ["credentials", "secrets", "gpg", "rotation", "shamir", "succession"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Security :: Cryptography",
+    "Topic :: System :: Systems Administration",
+]
+
+# Deliberately empty, and checked by CONTRIBUTING.md as an invariant.
+# GPG owns the container, the cipher and the integrity check, and is invoked
+# as a subprocess, never imported. It ships with Git for Windows and with
+# every Linux distribution. Key stretching is hashlib.scrypt, which is in the
+# standard library. There is nothing left to depend on.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/thefishplate/vaultline"
+Source = "https://github.com/thefishplate/vaultline"
+Changelog = "https://github.com/thefishplate/vaultline/blob/main/CHANGELOG.md"
+Issues = "https://github.com/thefishplate/vaultline/issues"
+
+[tool.setuptools]
+py-modules = ["vaultline"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.pytest.ini_options]
+python_files = ["vaultline_dev.py"]

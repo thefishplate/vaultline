@@ -1,0 +1,32 @@
+name: Tests
+
+# Fires on every push and pull request. publish.yml also runs the suite, but
+# only when a release is published: that makes a broken suite a blocked
+# release rather than an early warning. This is the early warning.
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, and the current release. The
+        # floor is the one that matters: it is the version a downstream
+        # packager may still be building against.
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # No install step and no dependencies: the suite is standard library
+      # only, and binds no listening socket it does not also close. If that
+      # ever stops being true, this job starts failing, which is the point.
+      - name: Run the test suite
+        run: python vaultline_dev.py
