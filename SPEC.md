@@ -127,7 +127,53 @@ machines. `clipboard_history_enabled()` detects both and the tool warns, but it
 cannot undo them. A timed clear that removes nothing is worse than none,
 because it buys confidence without buying safety.
 
-## 8. Not built
+## 8. Adapters
+
+An adapter is handed a value and returns a fact. Three rules, and each closes
+a specific hole:
+
+- **It never receives the Vault.** A bad adapter lies about one credential
+  rather than holding the store.
+- **It reports; the vault concludes.** `verify` returns True, False, or None.
+- **It fails closed.** Anything unrecognised raises rather than being guessed.
+
+Each declares `sanction`: `documented` for a published interface, `incidental`
+for opening a URL or using the clipboard, `unsanctioned` for driving something
+it was not invited to automate. Nothing unsanctioned belongs in this
+repository.
+
+### Testing them
+
+A hermetic suite runs against our own fake, and our fake is frozen at our
+understanding of the service. It proves the code self-consistent and can never
+notice a provider changing their API. Two different questions, two mechanisms:
+
+| Question | How | When |
+|---|---|---|
+| Is our code correct? | the contract, over simulated failures | every push |
+| Has the world moved? | a live run against drill accounts | scheduled |
+
+`FAILURE_SHAPES` enumerates the pathologies and what an adapter may conclude
+for each. **No shape permits True** apart from `deprecated`, where the service
+really did answer. The contract runs every adapter over every shape, and a
+deliberately wrong adapter is kept in the suite with a test that the contract
+rejects it - a contract that never fails anything proves nothing.
+
+### Fault injection is in the shipped code
+
+Failure handling you can only exercise under test is failure handling you
+cannot exercise against the real world. The hook is therefore permanent, and
+made safe structurally rather than by discipline: injection selects from a
+fixed catalogue of failures, so it cannot manufacture a success, and
+`Vault.verify` refuses to run while it is armed, so nothing injected becomes a
+belief about a real account.
+
+Every site is one call to `inject()`; `injection_points()` reports them from
+the source. Tests prove the table and the call sites agree both ways, and that
+every declared point is armed by at least one test - an injection point no test
+exercises advertises a failure mode as considered when nothing has checked it.
+
+## 9. Not built
 
 - **Threshold recovery.** A quorum wrapping alongside the passphrase one. The
   format is built for it; the policy around it - threshold, holders, what
@@ -135,7 +181,7 @@ because it buys confidence without buying safety.
   about people and cannot sensibly be fixed before there are any.
 - **Adapters, and any command-line interface.**
 
-## 9. Open
+## 10. Open
 
 - The threshold, when threshold recovery is built. Expensive to change once
   material has been distributed to holders.

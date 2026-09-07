@@ -15,6 +15,18 @@ particular release.
 ## [Unreleased]
 
 ### Added
+- **Transport, fault injection and the adapter contract.** `Transport` is the
+  only route to the network; `FAILURE_SHAPES` enumerates thirteen ways a
+  service fails or changes, each declaring what an adapter may conclude; and
+  the contract runs every adapter against every shape. A deliberately wrong
+  adapter is in the suite, with a test asserting the contract rejects it.
+- Fault injection lives in the shipped module rather than a test harness, so
+  it can be used against a real service on purpose. It can only make the
+  system more cautious - no shape produces a success - and `Vault.verify`
+  refuses to run while it is armed.
+- `injection_points()`, parsed from the source with `ast`, plus tests proving
+  the declared table and the call sites agree in both directions and that
+  every point is exercised.
 - **The clipboard tier.** `Vault.to_clipboard(name)` puts a value on the
   clipboard, blocks with a countdown, then takes it back. It blocks because a
   background timer does not survive the process exiting; it refuses to wipe
@@ -39,7 +51,7 @@ particular release.
 - scrypt stretching ahead of GPG, with parameters recorded per wrapping.
 - Refusal to operate beneath a folder that looks like a sync root.
 - Verify-then-swap saving, with a `.bak` retained.
-- 67 tests, including one asserting that adding a wrapping leaves the payload
+- 84 tests, including one asserting that adding a wrapping leaves the payload
   byte-identical, and one asserting that an older copy still opens after a
   wrapping has been removed.
 

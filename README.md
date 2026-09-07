@@ -52,6 +52,65 @@ into retiring a working credential.
 a verification budget is enforced and falling back to test the old value spends
 from it. When the budget runs out the tool stops rather than trying once more.
 
+## Adapters, and how they are tested
+
+An adapter is handed a value and returns a fact: `True`, `False`, or `None`
+for *could not tell*. **It never receives the vault** - a bad adapter should be
+able to lie about one credential, not hold the store - and it never concludes.
+The vault concludes.
+
+Testing them is the hard part, because a hermetic suite runs against your own
+fake, and your fake is frozen at your understanding of the service. It can
+prove your code is self-consistent and can never notice that a provider
+changed their API.
+
+So the failures are simulated instead, and the assertion is not *does it still
+work* - it cannot, the service changed - but **does it notice rather than
+guess**:
+
+```python
+vaultline.arm("transport.request", "rate_limited")
+adapter.verify(token)        # must be None. A 429 is not evidence.
+```
+
+Thirteen shapes are enumerated in `FAILURE_SHAPES`: endpoints withdrawn, auth
+schemes changed, HTML where JSON was, fields renamed, truncated reads, rate
+limits, timeouts. Each declares what an adapter is *allowed* to conclude, and
+**no shape permits `True`** except the one where the service genuinely did
+answer correctly while announcing its own retirement.
+
+The contract runs every adapter against every shape. There is a deliberately
+wrong adapter in the suite - one that treats every non-200 as a bad credential
+- and a test asserting the contract **rejects** it, because a contract that
+never fails anything is decoration.
+
+### Fault injection lives in the shipped code
+
+Not in a test harness. Failure handling you can only exercise under test is
+failure handling you cannot exercise against the real world, and being able to
+inject a 429 against a live service on purpose is worth more than any fake.
+
+Two rules make that safe, structurally rather than by discipline:
+
+- **Injection can only make the system more cautious.** You cannot hand it a
+  response; you choose a shape, and no shape produces a success. Forging a
+  working credential is not an API this module offers.
+- **Nothing injected can become evidence.** `Vault.verify` refuses to run while
+  injection is armed, because a rotation record is a claim about a real
+  account.
+
+Every injection site is one call, so one grep finds them all:
+
+```
+grep -n 'inject("' vaultline.py
+```
+
+and `vaultline.injection_points()` reports them with line numbers, parsed from
+the source with `ast` so it cannot drift. Three tests prove the declared table
+and the call sites match in both directions, and that **every declared point is
+armed by at least one test** - a point no test exercises is a lie, because it
+advertises a failure mode as considered when nothing has checked it.
+
 ## Getting a credential into a login form
 
 The lowest-risk option, and the only one implemented: the tool holds the value,
@@ -146,17 +205,17 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** Implemented and covered by 67 tests: the envelope, wrappings,
-saving, location safety, the rotation state machine, and the clipboard tier.
-Not implemented: adapters that talk to services, threshold recovery, and any
-command-line interface.
+**Pre-alpha.** Implemented and covered by 84 tests: the envelope, wrappings,
+saving, location safety, the rotation state machine, the clipboard tier, and
+the transport with its fault injection and adapter contract. Not implemented:
+any real adapter, threshold recovery, and any command-line interface.
 
 Nothing is published to PyPI yet.
 
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 67 tests
+python vaultline_dev.py             # 84 tests
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
 

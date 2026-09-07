@@ -248,6 +248,280 @@ def refuse_sync_root(path, override=False):
 
 
 # ---------------------------------------------------------------------------
+# Transport, and fault injection
+#
+# Adapters talk to services through Transport. The injection points live in
+# this module permanently rather than in a test harness, because a hook that
+# exists only under test cannot be exercised against the real world - and the
+# failure handling you can never exercise in production is the failure handling
+# you do not have.
+#
+# Two rules make that safe, and both are structural rather than a matter of
+# discipline:
+#
+# 1. **Injection can only ever make the system more cautious.** You cannot hand
+#    it a response; you choose a shape from FAILURE_SHAPES, and no shape in
+#    that table produces a success. Forging a working credential is not an API
+#    this module offers.
+#
+# 2. **Nothing injected may be read as evidence.** Vault.verify refuses to run
+#    while injection is armed, because a rotation record is a claim about a
+#    real account.
+#
+# Every injection site is a call to inject(), so one grep finds them all:
+#
+#     grep -n 'inject("' vaultline.py
+#
+# and injection_points() reports them with line numbers, so nobody has to know
+# the incantation. Three tests prove the table and the call sites match, in
+# both directions, and that every point is exercised.
+# ---------------------------------------------------------------------------
+
+
+class TransportError(VaultlineError):
+    """The request did not complete. Not evidence about a credential."""
+
+
+class AdapterError(VaultlineError):
+    """An adapter met something it does not understand, and stopped."""
+
+
+#: Every fault-injection point in this module, and the real failure each one
+#: stands for. The table is the inventory; tests prove it matches the code.
+INJECTION_POINTS = {
+    "transport.request": "the outbound HTTP call an adapter makes",
+}
+
+
+#: The ways a service can fail, or change under us. Each names an `allowed`
+#: set: what an adapter may conclude when it meets this shape.
+#:
+#: **True is in none of them.** That is the guarantee - injection cannot
+#: manufacture a success, so an armed hook can make the tool refuse to decide
+#: but never make it decide wrongly.
+#:
+#: `unauthorised` is the one case where False is permitted, because a 401 from
+#: the endpoint you expected really is the service rejecting the credential.
+#: It is also what a changed auth scheme looks like, and an adapter that cannot
+#: tell those apart should return None - hence both are allowed.
+FAILURE_SHAPES = {
+    "gone": {
+        "status": 404, "body": b'{"message":"Not Found"}',
+        "means": "the endpoint moved or was withdrawn",
+        "allowed": (None,)},
+    "unauthorised": {
+        "status": 401, "body": b'{"message":"Bad credentials"}',
+        "means": "credential rejected, or the auth scheme changed",
+        "allowed": (False, None)},
+    "forbidden": {
+        "status": 403, "body": b'{"message":"Forbidden"}',
+        "means": "scope or permission narrowed",
+        "allowed": (None,)},
+    "rate_limited": {
+        "status": 429, "body": b'{"message":"API rate limit exceeded"}',
+        "means": "throttled - says nothing at all about the credential",
+        "allowed": (None,)},
+    "bad_request": {
+        "status": 400, "body": b'{"message":"Missing required parameter"}',
+        "means": "a new required parameter appeared",
+        "allowed": (None,)},
+    "server_error": {
+        "status": 500, "body": b"upstream exploded",
+        "means": "the service is unwell",
+        "allowed": (None,)},
+    "html_login": {
+        "status": 200, "body": b"<html><body>Please sign in</body></html>",
+        "means": "redirected to a login or consent page; HTML where JSON was",
+        "allowed": (None,)},
+    "renamed_field": {
+        "status": 200, "body": b'{"account_name":"someone"}',
+        "means": "200, but the field we read has been renamed",
+        "allowed": (None,)},
+    "empty_body": {
+        "status": 200, "body": b"",
+        "means": "200 with nothing in it",
+        "allowed": (None,)},
+    "truncated_json": {
+        "status": 200, "body": b'{"login": "some',
+        "means": "a partial read",
+        "allowed": (None,)},
+    "deprecated": {
+        "status": 200, "body": b'{"login":"someone"}',
+        "headers": {"Sunset": "Sat, 01 Nov 2026 00:00:00 GMT"},
+        "means": "still working, and announcing that it will not be",
+        "allowed": (True, None)},
+    "timeout": {
+        "raises": "timed out",
+        "means": "connection lost mid-request",
+        "allowed": (None,)},
+    "connection_reset": {
+        "raises": "connection reset by peer",
+        "means": "the connection died",
+        "allowed": (None,)},
+}
+
+
+class Response:
+    """An HTTP response. Any status is data; only network failure raises."""
+
+    def __init__(self, status, body=b"", headers=None):
+        self.status = status
+        self.body = body
+        self.headers = dict(headers or {})
+
+    def json(self):
+        """Parsed body, or None if it is not JSON. Never raises.
+
+        An adapter that cannot parse the body has learned that the shape
+        changed, which is a reason to decline rather than to crash.
+        """
+        import json as _json
+
+        try:
+            return _json.loads(self.body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def __repr__(self):
+        return "Response(%r, %d bytes)" % (self.status, len(self.body))
+
+
+#: Armed injection: (point, shape) or None. Module state, deliberately, so
+#: that it is visible to injection_active() and to the guard in Vault.verify.
+_ARMED = {}
+
+
+def arm(point, shape):
+    """Arm a failure at an injection point. Returns a token for disarming.
+
+    Deliberately available outside tests. Being able to inject a 429 against
+    the real service, on purpose, and watch what happens is worth more than any
+    fake - and it is safe here because no shape can produce a success.
+    """
+    if point not in INJECTION_POINTS:
+        raise VaultlineError("unknown injection point %r; known: %s"
+                             % (point, ", ".join(sorted(INJECTION_POINTS))))
+    if shape not in FAILURE_SHAPES:
+        raise VaultlineError("unknown failure shape %r; known: %s"
+                             % (shape, ", ".join(sorted(FAILURE_SHAPES))))
+    _ARMED[point] = shape
+    return point
+
+
+def disarm(point=None):
+    if point is None:
+        _ARMED.clear()
+    else:
+        _ARMED.pop(point, None)
+
+
+def injection_active():
+    """What is currently armed. Empty when nothing is."""
+    return dict(_ARMED)
+
+
+def inject(point, produce):
+    """Return the real result, or the armed failure instead.
+
+    `produce` is a callable so the real work is skipped entirely when a failure
+    is armed - an injected timeout should not also make the request.
+    """
+    shape = _ARMED.get(point)
+    if shape is None:
+        return produce()
+    spec = FAILURE_SHAPES[shape]
+    if "raises" in spec:
+        raise TransportError("injected %s: %s" % (shape, spec["raises"]))
+    return Response(spec["status"], spec.get("body", b""), spec.get("headers"))
+
+
+def injection_points():
+    """Every injection site: name, what it stands for, and where it is.
+
+    Parsed from this module's own source, so it cannot drift from the code the
+    way a hand-kept list does.
+    """
+    import ast
+    import pathlib as _pathlib
+
+    source = _pathlib.Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    found = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "inject" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            name = node.args[0].value
+            found.append({"point": name,
+                          "means": INJECTION_POINTS.get(name, "(undeclared)"),
+                          "line": node.lineno})
+    return sorted(found, key=lambda f: f["line"])
+
+
+class Transport:
+    """The only way an adapter reaches the network.
+
+    One place for timeouts, one place for injection, and one place to look when
+    asking what this program can talk to.
+    """
+
+    def __init__(self, timeout=10):
+        self.timeout = timeout
+
+    def request(self, method, url, headers=None, body=None):
+        return inject("transport.request",
+                      lambda: self._request(method, url, headers, body))
+
+    def _request(self, method, url, headers, body):
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(url, data=body, method=method,
+                                     headers=dict(headers or {}))
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return Response(r.status, r.read(), dict(r.headers))
+        except urllib.error.HTTPError as exc:
+            # A status code is data, not an exception. Adapters decide.
+            return Response(exc.code, exc.read(), dict(exc.headers or {}))
+        except Exception as exc:
+            raise TransportError("%s %s: %s" % (method, url, exc)) from None
+
+
+class Adapter:
+    """What a service adapter must be.
+
+    **An adapter never receives the Vault.** It is handed a value and returns a
+    fact. A bad or compromised adapter should be able to lie about one
+    credential, not hold the store.
+
+    **It reports; the vault concludes.** `verify` returns True, False, or None
+    for *could not tell*, and None is the right answer far more often than it
+    looks. A 429 says nothing about a credential. Neither does a 500.
+
+    **It fails closed.** Anything unrecognised raises AdapterError rather than
+    being guessed at.
+    """
+
+    #: Whether this adapter uses an interface the service published, or drives
+    #: something it was not invited to automate. Checked by CI: nothing
+    #: unsanctioned belongs in this repository.
+    sanction = None
+    name = None
+    version = None
+
+    def __init__(self, transport=None):
+        self.transport = transport or Transport()
+
+    def verify(self, value):
+        raise NotImplementedError
+
+    def __repr__(self):
+        return "%s(%r, sanction=%r)" % (type(self).__name__, self.name,
+                                        self.sanction)
+
+
+# ---------------------------------------------------------------------------
 # The clipboard tier
 #
 # The lowest-risk way to put a credential into a login form: the tool holds the
@@ -691,7 +965,8 @@ class Vault:
         self.save(override_sync=override_sync)
         return self.rotations.get(name)
 
-    def verify(self, name, verifier, at=None, override_sync=False):
+    def verify(self, name, verifier, at=None, override_sync=False,
+               allow_injected=False):
         """Decide which value is in force, by asking the service.
 
         `verifier(value)` returns True if that value authenticates, False if it
@@ -707,6 +982,13 @@ class Vault:
         r = self.rotations.get(name)
         if not r or r["state"] not in (UNKNOWN, ACCEPTED):
             raise RotationError("%s has no rotation awaiting verification" % name)
+        if _ARMED and not allow_injected:
+            # A rotation record is a claim about a real account. Nothing
+            # produced by fault injection may become one.
+            raise RotationError(
+                "fault injection is armed (%s) and would be recorded as fact. "
+                "Disarm, or pass allow_injected=True if this is a test."
+                % ", ".join("%s=%s" % kv for kv in sorted(_ARMED.items())))
         if self.attempts_remaining(name) <= 0:
             raise RotationError(
                 "%s has no attempts left (%d used). Trying again risks locking "

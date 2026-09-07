@@ -633,6 +633,232 @@ class ClipboardTests(VaultCase):
         self.assertIn(vaultline.clipboard_history_enabled(), (True, False, None))
 
 
+class ReferenceAdapter(vaultline.Adapter):
+    """A correct adapter, and the smallest one that can be correct.
+
+    It exists to be run through the contract. Every real adapter should be
+    readable as a variation on this.
+    """
+
+    name = "reference"
+    sanction = "documented"
+    version = "0"
+
+    def verify(self, value):
+        try:
+            r = self.transport.request(
+                "GET", "http://127.0.0.1:1/user",
+                headers={"Authorization": "Bearer %s" % value})
+        except vaultline.TransportError:
+            return None                    # the request did not happen
+        if r.status == 401:
+            return False                   # the service rejected it
+        if r.status != 200:
+            return None                    # says nothing about the credential
+        body = r.json()
+        if body is None or "login" not in body:
+            return None                    # 200, but not the shape we know
+        return True
+
+
+class SloppyAdapter(ReferenceAdapter):
+    """A plausible adapter that is wrong in the usual way.
+
+    It treats every non-200 as "the credential is bad" - which turns a rate
+    limit or a 500 into evidence, and evidence is what retires a working
+    credential. Its purpose is to fail the contract: a contract that never
+    rejects anything is decoration.
+    """
+
+    name = "sloppy"
+
+    def verify(self, value):
+        try:
+            r = self.transport.request("GET", "http://127.0.0.1:1/user")
+        except vaultline.TransportError:
+            return False
+        return r.status == 200
+
+
+class AdapterContract:
+    """What every adapter must do when the world misbehaves.
+
+    Mix into a TestCase and provide `adapter()`. The assertion is never that
+    the adapter still works - it cannot, the service changed. It is that the
+    adapter **notices instead of guessing**.
+    """
+
+    def adapter(self):
+        raise NotImplementedError
+
+    def test_declares_a_sanction_and_a_name(self):
+        a = self.adapter()
+        self.assertIn(a.sanction, ("documented", "incidental", "unsanctioned"))
+        self.assertTrue(a.name)
+
+    def test_every_failure_shape_is_handled_without_guessing(self):
+        for shape, spec in sorted(vaultline.FAILURE_SHAPES.items()):
+            with self.subTest(shape=shape):
+                vaultline.arm("transport.request", shape)
+                try:
+                    result = self.adapter().verify("a-token")
+                except vaultline.AdapterError:
+                    continue               # failing closed is always allowed
+                finally:
+                    vaultline.disarm()
+                self.assertIn(
+                    result, spec["allowed"],
+                    "%s met %r (%s) and concluded %r; allowed: %s"
+                    % (self.adapter().name, shape, spec["means"], result,
+                       spec["allowed"]))
+
+    def test_never_claims_success_when_the_service_is_merely_unwell(self):
+        # The single most dangerous wrong answer: True when nothing was proven.
+        for shape in ("rate_limited", "server_error", "timeout", "gone"):
+            with self.subTest(shape=shape):
+                vaultline.arm("transport.request", shape)
+                try:
+                    self.assertIsNot(self.adapter().verify("a-token"), True)
+                except vaultline.AdapterError:
+                    pass
+                finally:
+                    vaultline.disarm()
+
+
+class ReferenceAdapterContractTests(AdapterContract, unittest.TestCase):
+    def adapter(self):
+        return ReferenceAdapter()
+
+
+class ContractHasTeethTests(unittest.TestCase):
+    """The contract must reject a wrong adapter, or it proves nothing."""
+
+    def tearDown(self):
+        vaultline.disarm()
+
+    def test_the_sloppy_adapter_fails_the_contract(self):
+        case = type("Case", (AdapterContract, unittest.TestCase),
+                    {"adapter": lambda self: SloppyAdapter()})("test_every_failure_shape_is_handled_without_guessing")
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.failures or result.errors,
+                        "the contract accepted an adapter that treats a 500 "
+                        "as a bad credential")
+
+    def test_a_rate_limit_is_not_evidence(self):
+        # Named separately because it is the case people get wrong most often.
+        vaultline.arm("transport.request", "rate_limited")
+        self.assertIsNone(ReferenceAdapter().verify("a-token"))
+        self.assertIs(SloppyAdapter().verify("a-token"), False)
+
+
+class InjectionInventoryTests(unittest.TestCase):
+    """The inventory is proved against the source, not maintained by hand."""
+
+    def sites(self):
+        return vaultline.injection_points()
+
+    def test_every_site_uses_a_declared_point(self):
+        for site in self.sites():
+            self.assertIn(site["point"], vaultline.INJECTION_POINTS,
+                          "line %d injects at an undeclared point" % site["line"])
+
+    def test_every_declared_point_is_used(self):
+        used = {s["point"] for s in self.sites()}
+        for point in vaultline.INJECTION_POINTS:
+            self.assertIn(point, used,
+                          "%r is declared but injected nowhere" % point)
+
+    def test_every_declared_point_is_exercised_by_a_test(self):
+        """An injection point no test uses is a lie.
+
+        It advertises a failure mode as considered when nothing has ever
+        checked it, which reads as coverage and is not.
+        """
+        source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        for point in vaultline.INJECTION_POINTS:
+            self.assertIn('arm("%s"' % point, source,
+                          "%r is never armed in the suite" % point)
+
+    def test_no_shape_can_manufacture_a_success_on_its_own(self):
+        # `deprecated` is the one shape where the service really did answer
+        # correctly, so True is legitimate there and nowhere else.
+        for name, spec in vaultline.FAILURE_SHAPES.items():
+            if name == "deprecated":
+                continue
+            self.assertNotIn(True, spec["allowed"],
+                             "%r would let injection forge a success" % name)
+
+    def test_arming_an_unknown_point_or_shape_is_refused(self):
+        with self.assertRaises(vaultline.VaultlineError):
+            vaultline.arm("no.such.point", "gone")
+        with self.assertRaises(vaultline.VaultlineError):
+            vaultline.arm("transport.request", "no-such-shape")
+
+    def test_injection_announces_itself(self):
+        vaultline.arm("transport.request", "gone")
+        try:
+            self.assertEqual(vaultline.injection_active(),
+                             {"transport.request": "gone"})
+        finally:
+            vaultline.disarm()
+        self.assertEqual(vaultline.injection_active(), {})
+
+
+class InjectedResultsAreNotEvidenceTests(VaultCase):
+    """A rotation record is a claim about a real account."""
+
+    def tearDown(self):
+        vaultline.disarm()
+        super().tearDown()
+
+    def test_verify_refuses_while_injection_is_armed(self):
+        self.make(secrets={"REGISTRAR": "old"})
+        v = vaultline.Vault.open(self.path, PASS)
+        v.begin_rotation("REGISTRAR", "new")
+        v.record_outcome("REGISTRAR", "unknown")
+        vaultline.arm("transport.request", "gone")
+        with self.assertRaises(vaultline.RotationError) as caught:
+            v.verify("REGISTRAR", lambda value: True)
+        self.assertIn("injection", str(caught.exception))
+
+    def test_a_test_may_opt_in_explicitly(self):
+        self.make(secrets={"REGISTRAR": "old"})
+        v = vaultline.Vault.open(self.path, PASS)
+        v.begin_rotation("REGISTRAR", "new")
+        v.record_outcome("REGISTRAR", "unknown")
+        vaultline.arm("transport.request", "gone")
+        self.assertEqual(v.verify("REGISTRAR", lambda value: None,
+                                  allow_injected=True), vaultline.UNKNOWN)
+
+
+class TransportTests(unittest.TestCase):
+    def tearDown(self):
+        vaultline.disarm()
+
+    def test_a_status_code_is_data_not_an_exception(self):
+        vaultline.arm("transport.request", "server_error")
+        r = vaultline.Transport().request("GET", "http://127.0.0.1:1/")
+        self.assertEqual(r.status, 500)
+
+    def test_a_network_failure_raises(self):
+        vaultline.arm("transport.request", "timeout")
+        with self.assertRaises(vaultline.TransportError):
+            vaultline.Transport().request("GET", "http://127.0.0.1:1/")
+
+    def test_an_unparseable_body_returns_none_rather_than_raising(self):
+        vaultline.arm("transport.request", "truncated_json")
+        self.assertIsNone(
+            vaultline.Transport().request("GET", "http://127.0.0.1:1/").json())
+
+    def test_injection_skips_the_real_request_entirely(self):
+        # An injected timeout must not also make the call. Reaching port 1
+        # would be slow and would leave a real connection attempt behind.
+        vaultline.arm("transport.request", "gone")
+        r = vaultline.Transport(timeout=0.001).request("GET", "http://127.0.0.1:1/")
+        self.assertEqual(r.status, 404)
+
+
 class GpgPathTests(unittest.TestCase):
     """Finding gpg. This is not incidental plumbing.
 

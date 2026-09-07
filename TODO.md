@@ -21,6 +21,10 @@
       history detection on Windows.
 - [x] **gpg discovery** outside Git Bash, with an actionable error.
 
+- [x] **Transport, fault injection, adapter contract.** Thirteen failure
+      shapes, a contract with teeth, and an injection inventory proved against
+      the source.
+
 ## Next
 
 - [ ] **Verifiers for documented services.** `(value) -> True | False | None`.
@@ -30,6 +34,10 @@
       change-in-place: with tokens the new credential can be verified working
       before the old one dies, and the ambiguous window closes entirely.
 - [ ] **A command-line interface**: list, get, set, hint, verify, rotate.
+- [ ] **A scheduled live run against drill accounts.** The simulation covers
+      the failures we imagined; only a real request notices the twelfth shape.
+      Never on pull requests - a fork must not be able to reach the
+      credentials.
 - [ ] **An emergency sheet**, and a refusal to call a rotation complete until
       it has been regenerated. A stale sheet that looks authoritative is worse
       than none.
