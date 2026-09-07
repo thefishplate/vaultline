@@ -286,6 +286,10 @@ class AdapterError(VaultlineError):
     """An adapter met something it does not understand, and stopped."""
 
 
+class ReadOnlyViolation(VaultlineError):
+    """Something tried to change the world through a read-only transport."""
+
+
 #: Every fault-injection point in this module, and the real failure each one
 #: stands for. The table is the inventory; tests prove it matches the code.
 INJECTION_POINTS = {
@@ -458,17 +462,55 @@ def injection_points():
     return sorted(found, key=lambda f: f["line"])
 
 
+#: Methods that may change something. HEAD and GET are absent, and OPTIONS
+#: with them, because none of them is supposed to alter state.
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
 class Transport:
     """The only way an adapter reaches the network.
 
     One place for timeouts, one place for injection, and one place to look when
     asking what this program can talk to.
+
+    **`readonly=True` is how rehearsing against a real account becomes
+    defensible rather than merely careful.** Risk attaches to operations, but
+    code is organised by path - and once `verify` and `submit` share a helper,
+    that helper is as dangerous as its riskiest caller, whatever the docstring
+    over `verify` says. Enforcing here means an adapter may share as much code
+    as it likes and still cannot change anything, because the object it was
+    handed will not carry the request.
+
+    That turns "safe to point at my own account" from a claim about adapter
+    discipline into a property of the object, which is the difference between
+    a promise and a guarantee.
     """
 
-    def __init__(self, timeout=10):
+    def __init__(self, timeout=10, readonly=False):
         self.timeout = timeout
+        self.readonly = readonly
 
-    def request(self, method, url, headers=None, body=None):
+    def request(self, method, url, headers=None, body=None,
+                side_effect_free=False, reason=None):
+        """Make a request. Refuses to mutate when read-only.
+
+        Some genuine verification endpoints are POST - OAuth token
+        introspection, for one - so there is an escape hatch, and it demands a
+        `reason` in the source. An exception you have to write a sentence for
+        is an exception somebody reads later; one you can take by passing True
+        is one that spreads.
+        """
+        if self.readonly and method.upper() in MUTATING_METHODS:
+            if not side_effect_free:
+                raise ReadOnlyViolation(
+                    "%s %s through a read-only transport. If this really "
+                    "changes nothing, pass side_effect_free=True with a reason."
+                    % (method.upper(), url))
+            if not reason:
+                raise ReadOnlyViolation(
+                    "%s %s claims to be side-effect-free but gives no reason. "
+                    "Say why, in the source, so the next reader can check."
+                    % (method.upper(), url))
         return inject("transport.request",
                       lambda: self._request(method, url, headers, body))
 
@@ -512,6 +554,11 @@ class Adapter:
 
     def __init__(self, transport=None):
         self.transport = transport or Transport()
+
+    @classmethod
+    def read_only(cls, timeout=10):
+        """An adapter that cannot change anything, whatever its code does."""
+        return cls(transport=Transport(timeout=timeout, readonly=True))
 
     def verify(self, value):
         raise NotImplementedError

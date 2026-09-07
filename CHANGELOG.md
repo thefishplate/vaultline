@@ -15,6 +15,12 @@ particular release.
 ## [Unreleased]
 
 ### Added
+- **A read-only transport.** `Transport(readonly=True)` refuses mutating
+  methods, so an adapter can share code between `verify` and `submit` and
+  still be unable to change anything while verifying. The escape hatch for
+  genuinely side-effect-free POSTs demands a written reason. The contract
+  asserts every adapter verifies read-only, and an adapter that mutates during
+  verification is kept in the suite to prove the check catches it.
 - **Transport, fault injection and the adapter contract.** `Transport` is the
   only route to the network; `FAILURE_SHAPES` enumerates thirteen ways a
   service fails or changes, each declaring what an adapter may conclude; and
@@ -51,7 +57,7 @@ particular release.
 - scrypt stretching ahead of GPG, with parameters recorded per wrapping.
 - Refusal to operate beneath a folder that looks like a sync root.
 - Verify-then-swap saving, with a `.bak` retained.
-- 84 tests, including one asserting that adding a wrapping leaves the payload
+- 93 tests, including one asserting that adding a wrapping leaves the payload
   byte-identical, and one asserting that an older copy still opens after a
   wrapping has been removed.
 

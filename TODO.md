@@ -21,6 +21,8 @@
       history detection on Windows.
 - [x] **gpg discovery** outside Git Bash, with an actionable error.
 
+- [x] **Read-only transport**, so rehearsing against a real account is a
+      property of the object rather than a promise about the code.
 - [x] **Transport, fault injection, adapter contract.** Thirteen failure
       shapes, a contract with teeth, and an injection inventory proved against
       the source.
@@ -60,7 +62,7 @@
 - **The clipboard is readable by any process running as you**, and the timed
   clear does not remove anything Windows has already put in clipboard history
   or synced to another device. vaultline warns; it cannot fix this.
-- **The suite is slow** - about a minute, nearly all of it GPG subprocesses.
+- **The suite is slow** - about a hundred seconds, nearly all of it GPG subprocesses.
   The rotation tests save at each step and every save verifies by decrypting,
   which is the behaviour under test rather than overhead to remove.
 - **No command-line interface yet**, so today this is a library and nothing else.

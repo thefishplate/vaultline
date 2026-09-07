@@ -712,6 +712,26 @@ class AdapterContract:
                     % (self.adapter().name, shape, spec["means"], result,
                        spec["allowed"]))
 
+    def test_verify_completes_under_a_read_only_transport(self):
+        """verify must not change anything, and this proves it rather than
+        trusting the adapter to have meant not to.
+
+        An adapter whose verify shares a helper with submit will fail here the
+        moment that helper starts mutating - which is exactly when you want to
+        find out, rather than after it has run against a real account.
+        """
+        adapter = type(self.adapter())(
+            transport=vaultline.Transport(readonly=True))
+        vaultline.arm("transport.request", "unauthorised")
+        try:
+            adapter.verify("a-token")
+        except vaultline.ReadOnlyViolation:
+            self.fail("%s tried to mutate while verifying" % adapter.name)
+        except vaultline.AdapterError:
+            pass
+        finally:
+            vaultline.disarm()
+
     def test_never_claims_success_when_the_service_is_merely_unwell(self):
         # The single most dangerous wrong answer: True when nothing was proven.
         for shape in ("rate_limited", "server_error", "timeout", "gone"):
@@ -750,6 +770,91 @@ class ContractHasTeethTests(unittest.TestCase):
         vaultline.arm("transport.request", "rate_limited")
         self.assertIsNone(ReferenceAdapter().verify("a-token"))
         self.assertIs(SloppyAdapter().verify("a-token"), False)
+
+
+class MutatingVerifyAdapter(ReferenceAdapter):
+    """An adapter whose verify quietly changes something.
+
+    This is what happens when verify and submit share a helper and the helper
+    grows a side effect. It exists so that the read-only contract test can be
+    shown to catch it.
+    """
+
+    name = "mutating"
+
+    def verify(self, value):
+        self.transport.request("POST", "http://127.0.0.1:1/user/keys")
+        return True
+
+
+class ReadOnlyTransportTests(unittest.TestCase):
+    def tearDown(self):
+        vaultline.disarm()
+
+    def test_a_read_only_transport_refuses_to_mutate(self):
+        transport = vaultline.Transport(readonly=True)
+        for method in sorted(vaultline.MUTATING_METHODS):
+            with self.subTest(method=method):
+                with self.assertRaises(vaultline.ReadOnlyViolation):
+                    transport.request(method, "http://127.0.0.1:1/")
+
+    def test_reads_are_allowed(self):
+        vaultline.arm("transport.request", "gone")
+        transport = vaultline.Transport(readonly=True)
+        for method in ("GET", "HEAD", "OPTIONS"):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    transport.request(method, "http://127.0.0.1:1/").status, 404)
+
+    def test_an_ordinary_transport_allows_everything(self):
+        vaultline.arm("transport.request", "gone")
+        self.assertEqual(
+            vaultline.Transport().request("POST", "http://127.0.0.1:1/").status, 404)
+
+    def test_a_side_effect_free_post_needs_a_stated_reason(self):
+        # Some verification endpoints really are POST. An exception you have to
+        # write a sentence for is one somebody reads later.
+        transport = vaultline.Transport(readonly=True)
+        with self.assertRaises(vaultline.ReadOnlyViolation) as caught:
+            transport.request("POST", "http://127.0.0.1:1/introspect",
+                              side_effect_free=True)
+        self.assertIn("reason", str(caught.exception))
+
+    def test_a_side_effect_free_post_with_a_reason_is_allowed(self):
+        vaultline.arm("transport.request", "gone")
+        transport = vaultline.Transport(readonly=True)
+        self.assertEqual(
+            transport.request("POST", "http://127.0.0.1:1/introspect",
+                              side_effect_free=True,
+                              reason="RFC 7662 introspection reads a token").status,
+            404)
+
+    def test_the_refusal_happens_before_the_request_is_attempted(self):
+        # Even with a failure armed, the read-only check comes first: the
+        # objection is to what was attempted, not to what came back.
+        vaultline.arm("transport.request", "gone")
+        with self.assertRaises(vaultline.ReadOnlyViolation):
+            vaultline.Transport(readonly=True).request("DELETE", "http://127.0.0.1:1/")
+
+    def test_the_helper_builds_a_read_only_adapter(self):
+        self.assertTrue(ReferenceAdapter.read_only().transport.readonly)
+
+
+class ReadOnlyContractHasTeethTests(unittest.TestCase):
+    """The read-only requirement must catch an adapter that mutates."""
+
+    def tearDown(self):
+        vaultline.disarm()
+
+    def test_an_adapter_that_mutates_while_verifying_fails_the_contract(self):
+        case = type("Case", (AdapterContract, unittest.TestCase),
+                    {"adapter": lambda self: MutatingVerifyAdapter()})(
+                        "test_verify_completes_under_a_read_only_transport")
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.failures or result.errors,
+                        "the contract accepted an adapter that mutates during "
+                        "verification")
 
 
 class InjectionInventoryTests(unittest.TestCase):

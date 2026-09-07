@@ -90,6 +90,32 @@ Not in a test harness. Failure handling you can only exercise under test is
 failure handling you cannot exercise against the real world, and being able to
 inject a 429 against a live service on purpose is worth more than any fake.
 
+### Rehearsing against a real account
+
+Risk attaches to *operations*, but code is organised by *paths* - and once
+`verify` and `submit` share a helper, that helper is as dangerous as its
+riskiest caller, whatever the docstring over `verify` says.
+
+So it is enforced underneath:
+
+```python
+adapter = GithubAdapter.read_only()      # cannot change anything
+```
+
+A read-only transport refuses POST, PUT, PATCH and DELETE. An adapter may
+share as much code as it likes and still cannot mutate, because the object it
+was handed will not carry the request. That turns "safe to point at my own
+account" from a claim about adapter discipline into a property of the object.
+
+Some genuine verification endpoints are POST - OAuth introspection, for one -
+so there is an escape hatch that demands a written reason. An exception you
+have to write a sentence for is one somebody reads later; one you can take by
+passing `True` is one that spreads.
+
+The contract asserts every adapter's `verify` completes read-only, and there is
+an adapter in the suite that mutates while verifying, with a test that the
+contract catches it.
+
 Two rules make that safe, structurally rather than by discipline:
 
 - **Injection can only make the system more cautious.** You cannot hand it a
@@ -205,7 +231,7 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** Implemented and covered by 84 tests: the envelope, wrappings,
+**Pre-alpha.** Implemented and covered by 93 tests: the envelope, wrappings,
 saving, location safety, the rotation state machine, the clipboard tier, and
 the transport with its fault injection and adapter contract. Not implemented:
 any real adapter, threshold recovery, and any command-line interface.
@@ -215,7 +241,7 @@ Nothing is published to PyPI yet.
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 84 tests
+python vaultline_dev.py             # 93 tests
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
 
