@@ -55,6 +55,30 @@ except (ImportError, _PackageNotFoundError):  # pragma: no cover - source checko
 FORMAT = "vaultline"
 FORMAT_VERSION = 0
 
+#: The payload is a document, not a bare mapping, so that rotation state lives
+#: inside the encryption alongside the values it describes. Version 0 was a
+#: bare {name: value} mapping and is still read; it upgrades on the next save.
+PAYLOAD_VERSION = 1
+
+#: Rotation states. The one that matters is UNKNOWN.
+#:
+#: A service can accept a change and lose the response. Treating that as
+#: failure - discarding the new value and keeping the old - is how an account
+#: becomes unreachable, because the old value is the one that no longer works.
+#: So UNKNOWN keeps *both* values and is resolved by asking the service, never
+#: by assuming. A superset beats an empty set.
+NONE = "none"
+PENDING = "pending"
+UNKNOWN = "unknown"
+ACCEPTED = "accepted"
+LOCKED_OUT = "locked_out"
+ROTATION_STATES = (NONE, PENDING, UNKNOWN, ACCEPTED, LOCKED_OUT)
+
+#: Attempting a wrong credential can lock an account. The limit is part of
+#: correctness, not politeness: a verification that triggers lockout has
+#: destroyed access while checking whether access works.
+DEFAULT_MAX_ATTEMPTS = 3
+
 
 class VaultlineError(Exception):
     """Base for every error this module raises deliberately."""
@@ -70,6 +94,14 @@ class BadEnvelope(VaultlineError):
 
 class UnsafeLocation(VaultlineError):
     pass
+
+
+class RotationError(VaultlineError):
+    pass
+
+
+class LockedOut(RotationError):
+    """Neither value authenticates. Nothing is deleted; a human must intervene."""
 
 
 def default_kdf():
@@ -175,16 +207,50 @@ class Vault:
     that care should not keep one alive longer than they need to.
     """
 
-    def __init__(self, path, envelope, master_key, secrets, payload=None):
+    def __init__(self, path, envelope, master_key, secrets, payload=None,
+                 rotations=None):
         self.path = path
         self.envelope = envelope
         self._master = master_key
         self.secrets = secrets
+        self.rotations = dict(rotations or {})
         # The payload ciphertext as it currently stands on disk, and a snapshot
         # of what it decrypts to. Together they let save() tell whether the
-        # secrets actually changed - see the note there.
+        # contents actually changed - see the note there.
         self._payload = payload
-        self._clean = dict(secrets)
+        self._clean = self._document_json()
+
+    def _document(self):
+        """The decrypted payload, as it is written."""
+        return {
+            "payload_version": PAYLOAD_VERSION,
+            "secrets": self.secrets,
+            "rotations": self.rotations,
+        }
+
+    def _document_json(self):
+        import json
+
+        return json.dumps(self._document(), indent=2, sort_keys=True)
+
+    @staticmethod
+    def _parse_document(raw):
+        """Read a payload document, accepting the version 0 bare mapping.
+
+        Returns (secrets, rotations). A version this reader does not know is
+        refused rather than partially understood: silently ignoring a field it
+        cannot interpret is how a half-finished rotation gets lost.
+        """
+        if not isinstance(raw, dict):
+            raise BadEnvelope("payload is not an object")
+        if "payload_version" not in raw:
+            return dict(raw), {}          # version 0: a bare mapping
+        version = raw.get("payload_version")
+        if not isinstance(version, int) or version > PAYLOAD_VERSION:
+            raise BadEnvelope(
+                "payload is version %r; this reader understands up to %d and "
+                "will not guess" % (version, PAYLOAD_VERSION))
+        return dict(raw.get("secrets") or {}), dict(raw.get("rotations") or {})
 
     # -- construction ----------------------------------------------------
 
@@ -246,8 +312,13 @@ class Vault:
             raise BadPassphrase("no wrapping opened with that passphrase")
 
         payload = envelope.get("payload")
-        secrets = json.loads(_decrypt(payload, master).decode("utf-8")) if payload else {}
-        return cls(path, envelope, master, secrets, payload=payload)
+        if payload:
+            secrets, rotations = cls._parse_document(
+                json.loads(_decrypt(payload, master).decode("utf-8")))
+        else:
+            secrets, rotations = {}, {}
+        return cls(path, envelope, master, secrets, payload=payload,
+                   rotations=rotations)
 
     @staticmethod
     def _check_envelope(envelope):
@@ -324,23 +395,26 @@ class Vault:
         # withdrawing a way in must leave the payload alone, so that a file
         # replicated widely does not have to be redistributed because somebody
         # was granted access.
-        if self._payload is not None and self.secrets == self._clean:
+        document = self._document_json()
+        if self._payload is not None and document == self._clean:
             envelope["payload"] = self._payload
         else:
-            body = json.dumps(self.secrets, indent=2, sort_keys=True).encode("utf-8")
-            envelope["payload"] = _encrypt(body, self._master)
+            envelope["payload"] = _encrypt(document.encode("utf-8"), self._master)
 
         tmp = self.path.parent / (self.path.name + ".new")
         tmp.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
 
         check = json.loads(tmp.read_text(encoding="utf-8"))
         self._check_envelope(check)
-        back = json.loads(_decrypt(check["payload"], self._master).decode("utf-8"))
-        if back != self.secrets:
+        back_secrets, back_rotations = self._parse_document(
+            json.loads(_decrypt(check["payload"], self._master).decode("utf-8")))
+        if back_secrets != self.secrets or back_rotations != self.rotations:
             tmp.unlink(missing_ok=True)
             raise VaultlineError(
-                "ABORT - the file read back with %d entries, expected %d. "
-                "%s is untouched." % (len(back), len(self.secrets), self.path.name))
+                "ABORT - the file read back with %d secrets and %d rotations, "
+                "expected %d and %d. %s is untouched."
+                % (len(back_secrets), len(back_rotations), len(self.secrets),
+                   len(self.rotations), self.path.name))
 
         backup = None
         if self.path.exists():
@@ -349,8 +423,152 @@ class Vault:
         tmp.replace(self.path)
         self.envelope = envelope
         self._payload = envelope["payload"]
-        self._clean = dict(self.secrets)
+        self._clean = document
         return backup
+
+    # -- rotation --------------------------------------------------------
+    #
+    # The failure this exists to prevent: a service accepts a new value, the
+    # record of it is lost, and the account becomes unreachable. Every rule
+    # below follows from that one sentence.
+
+    def rotation(self, name):
+        """The rotation record for a secret, or a fresh one."""
+        return self.rotations.get(name) or {"state": NONE, "attempts": 0}
+
+    def rotation_state(self, name):
+        return self.rotation(name)["state"]
+
+    def pending(self, name):
+        """The candidate value, if one exists. What the operator types in."""
+        return self.rotation(name).get("pending")
+
+    def attempts_remaining(self, name):
+        r = self.rotation(name)
+        return max(0, r.get("max_attempts", DEFAULT_MAX_ATTEMPTS) - r.get("attempts", 0))
+
+    def begin_rotation(self, name, new_value, at=None, max_attempts=None,
+                       override_sync=False):
+        """Record a candidate, and write it to disk **before** it is submitted.
+
+        The ordering is the whole point. If the candidate is submitted first
+        and the machine dies before the record is written, the only copy of a
+        value the service may now be enforcing is gone. Writing first means a
+        crash at any moment afterwards leaves both values on disk, and a
+        superset is always recoverable where an empty set is not.
+
+        This saves. It is not an in-memory operation that you remember to
+        persist, because remembering is exactly what fails.
+        """
+        if not new_value:
+            raise RotationError("a rotation needs a candidate value")
+        state = self.rotation_state(name)
+        if state in (PENDING, UNKNOWN, ACCEPTED):
+            raise RotationError(
+                "%s is already mid-rotation (%s); resolve it before starting another"
+                % (name, state))
+        self.rotations[name] = {
+            "state": PENDING,
+            "pending": new_value,
+            "previous": self.secrets.get(name),
+            "started_at": at,
+            "attempts": 0,
+            "max_attempts": max_attempts or DEFAULT_MAX_ATTEMPTS,
+        }
+        self.save(override_sync=override_sync)
+        return self.rotations[name]
+
+    def record_outcome(self, name, outcome, at=None, override_sync=False):
+        """Classify what the service did with the submission.
+
+        Three outcomes, and the middle one is the reason this is a state
+        machine rather than an if-statement:
+
+        - ``rejected``  - demonstrably refused *before* being applied: a
+          validation error, a policy rejection. Only then is it safe to
+          discard the candidate.
+        - ``unknown``   - a timeout, a 5xx, a dropped connection, anything
+          ambiguous. **Both values are kept.** Never deleted.
+        - ``accepted``  - the form was taken. This is *not* activation: the
+          service may have truncated or normalised what it stored, so the old
+          value is retained until a fresh login proves which one is in force.
+        """
+        if outcome not in ("rejected", "unknown", "accepted"):
+            raise RotationError("outcome must be rejected, unknown or accepted")
+        r = self.rotations.get(name)
+        if not r or r["state"] != PENDING:
+            raise RotationError("%s has no submitted rotation to classify" % name)
+        if outcome == "rejected":
+            # The only branch that discards anything, and only because the
+            # service said it never applied the change.
+            del self.rotations[name]
+        else:
+            r["state"] = UNKNOWN if outcome == "unknown" else ACCEPTED
+            r["classified_at"] = at
+        self.save(override_sync=override_sync)
+        return self.rotations.get(name)
+
+    def verify(self, name, verifier, at=None, override_sync=False):
+        """Decide which value is in force, by asking the service.
+
+        `verifier(value)` returns True if that value authenticates, False if it
+        demonstrably does not, and **None if it could not tell** - a network
+        failure is not evidence either way, and treating it as one is the same
+        mistake as treating an ambiguous submission as failure.
+
+        The vault calls the verifier and draws the conclusion. The verifier
+        supplies a fact, never a verdict: an adapter that could return
+        "success" on its own authority could talk this into retiring a working
+        credential.
+        """
+        r = self.rotations.get(name)
+        if not r or r["state"] not in (UNKNOWN, ACCEPTED):
+            raise RotationError("%s has no rotation awaiting verification" % name)
+        if self.attempts_remaining(name) <= 0:
+            raise RotationError(
+                "%s has no attempts left (%d used). Trying again risks locking "
+                "the account; use the recovery path instead."
+                % (name, r.get("attempts", 0)))
+
+        r["attempts"] = r.get("attempts", 0) + 1
+        self.save(override_sync=override_sync)
+
+        result = verifier(r["pending"])
+        if result is None:
+            return UNKNOWN                     # learned nothing; nothing changes
+        if result:
+            self.secrets[name] = r["pending"]  # the candidate is in force
+            del self.rotations[name]
+            self.save(override_sync=override_sync)
+            return "active"
+
+        if self.attempts_remaining(name) <= 0:
+            raise RotationError(
+                "%s: the candidate failed and there are no attempts left to "
+                "test the previous value. Stopping rather than risking lockout."
+                % name)
+        r["attempts"] += 1
+        self.save(override_sync=override_sync)
+        previous = verifier(r.get("previous"))
+        if previous:
+            # The change did not take. Now, and only now, is the candidate junk.
+            del self.rotations[name]
+            self.save(override_sync=override_sync)
+            return NONE
+        if previous is None:
+            return UNKNOWN
+
+        r["state"] = LOCKED_OUT
+        r["locked_out_at"] = at
+        self.save(override_sync=override_sync)
+        raise LockedOut(
+            "%s: neither the candidate nor the previous value authenticates. "
+            "Nothing has been deleted - both are still in the vault. Use the "
+            "account recovery path." % name)
+
+    def mid_rotation(self):
+        """Every secret not currently in a settled state. The work list."""
+        return {n: r for n, r in self.rotations.items() if r["state"] != NONE}
 
     # -- the envelope, readable by anyone --------------------------------
 

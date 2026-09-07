@@ -73,19 +73,47 @@ holds an earlier copy holds the wrapping it was written with, permanently.
 withdrawal, never all of it. There is a test named for this so that nobody
 later mistakes one for the other.
 
-## 6. Not built
+## 6. Rotation
 
-- **Rotation state machine.** Three outcomes, not two: rejected, *unknown*,
-  accepted. Ambiguity is the dangerous case - a service that commits a change
-  and loses the response must never be read as failure. Activation requires a
-  fresh verified login, because acceptance of a form is not proof.
+Three outcomes, not two, and the middle one is why this is a state machine.
+
+| Outcome | Meaning | What happens |
+|---|---|---|
+| `rejected` | demonstrably refused before being applied | discard the candidate |
+| `unknown` | timeout, 5xx, dropped connection | **keep both values** |
+| `accepted` | the form was taken | keep both; this is not activation |
+
+The candidate is written to disk **before** it is submitted. If it were
+submitted first and the machine died, the only record of a value the service
+may now be enforcing would be gone.
+
+Activation requires asking the service. `verify(name, verifier)` calls a
+verifier that returns True, False, or **None for could not tell**, and the
+vault draws the conclusion:
+
+- candidate authenticates → it becomes the value, the rotation closes
+- candidate fails, previous authenticates → the change never took; discard it
+- neither authenticates → stop, delete nothing, raise
+- could not tell → nothing changes
+
+**The verifier supplies a fact, never a verdict.** An adapter able to report
+success on its own authority could talk the vault into retiring a working
+credential, which is the one failure this whole machine exists to prevent.
+
+**Retry limits are correctness.** A wrong guess can lock an account, so the
+budget is enforced and persisted before each attempt — a crash mid-attempt must
+still count it. Falling back to test the previous value spends from the same
+budget, and when it is exhausted the tool stops.
+
+## 7. Not built
+
 - **Threshold recovery.** A quorum wrapping alongside the passphrase one. The
   format is built for it; the policy around it - threshold, holders, what
   authorises a succession - is deliberately absent, because those are decisions
   about people and cannot sensibly be fixed before there are any.
 - **Adapters, and any command-line interface.**
 
-## 7. Open
+## 8. Open
 
 - The threshold, when threshold recovery is built. Expensive to change once
   material has been distributed to holders.

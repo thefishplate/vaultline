@@ -14,6 +14,44 @@ opposite: replicate it, deliberately, as widely as you like. That is only a
 sane thing to say if the payload key is random rather than remembered - so it
 is.
 
+## Rotation
+
+The failure this exists to prevent: a service accepts a new value, the record
+of it is lost, and the account becomes unreachable.
+
+Three outcomes, not two. The middle one is the reason this is a state machine:
+
+```
+begin_rotation()   candidate written to disk BEFORE it is submitted
+                   - a crash afterwards leaves both values, and a superset
+                     is recoverable where an empty set is not
+
+record_outcome()   rejected  demonstrably refused before being applied
+                             -> discard the candidate; the old value stands
+                   unknown   timeout, 5xx, dropped connection
+                             -> KEEP BOTH. Never delete.
+                   accepted  the form was taken - which is not activation,
+                             because services truncate and normalise
+
+verify()           ask the service which value it accepts.
+                   candidate works        -> it becomes the value
+                   candidate fails, old works -> the change never took
+                   neither works          -> stop, delete nothing, alarm
+                   could not tell         -> learn nothing, change nothing
+```
+
+The verifier returns True, False or **None**. A network failure is not evidence
+either way, and treating it as evidence is the same mistake as treating an
+ambiguous submission as failure.
+
+**The vault draws the conclusion; the verifier supplies only a fact.** An
+adapter that could report success on its own authority could talk the vault
+into retiring a working credential.
+
+**Retry limits are part of correctness.** A wrong guess can lock an account, so
+a verification budget is enforced and falling back to test the old value spends
+from it. When the budget runs out the tool stops rather than trying once more.
+
 ## The two properties
 
 **Re-wrapping is not re-encryption.** Granting or withdrawing a way in encrypts
@@ -66,18 +104,23 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** The envelope, wrapping, saving and location safety are
-implemented and covered by 34 tests. Not implemented: the rotation state
-machine, threshold recovery, adapters, and any command-line interface.
+**Pre-alpha.** Implemented and covered by 56 tests: the envelope, wrappings,
+saving, location safety, and the rotation state machine. Not implemented:
+threshold recovery, adapters, and any command-line interface.
 
 Nothing is published to PyPI yet.
 
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 34 tests, about 18 seconds
+python vaultline_dev.py             # 56 tests, about a minute
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
+
+Nearly all of that minute is GPG subprocesses. The rotation tests are slow
+because the state machine saves at each step, and each save encrypts and then
+decrypts again to check the write survived - which is the behaviour being
+tested, so it is not something to optimise away.
 
 The suite uses deliberately weak KDF parameters so that it finishes; one test
 exercises the shipped parameters, because a suite that only tests the cheap

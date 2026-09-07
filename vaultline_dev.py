@@ -329,6 +329,226 @@ class KdfTests(unittest.TestCase):
         self.assertGreater(elapsed, 0.02, "the real KDF is suspiciously cheap")
 
 
+class Verifier:
+    """A scripted stand-in for asking a service which value it accepts.
+
+    Returns True, False or None per call, in order. None means *could not
+    tell* - a network failure is not evidence, and the vault must not treat
+    it as any.
+    """
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.asked = []
+
+    def __call__(self, value):
+        self.asked.append(value)
+        return self.results.pop(0) if self.results else False
+
+
+class RotationTests(VaultCase):
+    """The state machine. Every rule here exists to stop one thing: a service
+    accepting a new value while the record of it is lost."""
+
+    def setUp(self):
+        super().setUp()
+        self.make(secrets={"REGISTRAR": "old-value"})
+        self.v = vaultline.Vault.open(self.path, PASS)
+
+    def reopened(self):
+        return vaultline.Vault.open(self.path, PASS)
+
+    # -- starting --------------------------------------------------------
+
+    def test_the_candidate_is_on_disk_before_anything_is_submitted(self):
+        # The ordering is the whole point: a crash after submission must never
+        # find the candidate missing.
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.assertEqual(self.reopened().pending("REGISTRAR"), "new-value")
+
+    def test_the_previous_value_is_kept_alongside(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        r = self.reopened().rotation("REGISTRAR")
+        self.assertEqual(r["previous"], "old-value")
+        self.assertEqual(self.reopened().secrets["REGISTRAR"], "old-value")
+
+    def test_a_second_rotation_is_refused_while_one_is_in_flight(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        with self.assertRaises(vaultline.RotationError):
+            self.v.begin_rotation("REGISTRAR", "newer-value")
+
+    def test_an_empty_candidate_is_refused(self):
+        with self.assertRaises(vaultline.RotationError):
+            self.v.begin_rotation("REGISTRAR", "")
+
+    # -- classifying the submission --------------------------------------
+
+    def test_rejected_discards_the_candidate_and_leaves_the_old_value(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "rejected")
+        self.assertEqual(self.reopened().rotation_state("REGISTRAR"), vaultline.NONE)
+        self.assertEqual(self.reopened().secrets["REGISTRAR"], "old-value")
+
+    def test_unknown_keeps_both_values(self):
+        """The case that motivates the whole design.
+
+        A service can apply a change and lose the response. Reading that as
+        failure - discarding the candidate - leaves only the value that no
+        longer works.
+        """
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "unknown")
+        r = self.reopened()
+        self.assertEqual(r.rotation_state("REGISTRAR"), vaultline.UNKNOWN)
+        self.assertEqual(r.pending("REGISTRAR"), "new-value")
+        self.assertEqual(r.secrets["REGISTRAR"], "old-value")
+
+    def test_accepted_is_not_activation(self):
+        # Services truncate and normalise. Acceptance of a form is not proof
+        # of what is now in force.
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "accepted")
+        r = self.reopened()
+        self.assertEqual(r.rotation_state("REGISTRAR"), vaultline.ACCEPTED)
+        self.assertEqual(r.secrets["REGISTRAR"], "old-value")
+
+    def test_an_unknown_outcome_word_is_refused(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        with self.assertRaises(vaultline.RotationError):
+            self.v.record_outcome("REGISTRAR", "probably-fine")
+
+    def test_classifying_without_a_rotation_is_refused(self):
+        with self.assertRaises(vaultline.RotationError):
+            self.v.record_outcome("REGISTRAR", "accepted")
+
+    # -- verification ----------------------------------------------------
+
+    def test_a_verified_candidate_becomes_the_value(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "accepted")
+        self.assertEqual(self.v.verify("REGISTRAR", Verifier(True)), "active")
+        r = self.reopened()
+        self.assertEqual(r.secrets["REGISTRAR"], "new-value")
+        self.assertEqual(r.rotation_state("REGISTRAR"), vaultline.NONE)
+
+    def test_a_change_that_did_not_take_is_rolled_back(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "unknown")
+        # candidate fails, previous works: the service never applied it.
+        self.assertEqual(self.v.verify("REGISTRAR", Verifier(False, True)),
+                         vaultline.NONE)
+        r = self.reopened()
+        self.assertEqual(r.secrets["REGISTRAR"], "old-value")
+        self.assertEqual(r.rotation_state("REGISTRAR"), vaultline.NONE)
+
+    def test_an_inconclusive_verifier_changes_nothing(self):
+        # A network failure is not evidence. Treating it as one is the same
+        # mistake as treating an ambiguous submission as failure.
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "unknown")
+        self.assertEqual(self.v.verify("REGISTRAR", Verifier(None)),
+                         vaultline.UNKNOWN)
+        r = self.reopened()
+        self.assertEqual(r.rotation_state("REGISTRAR"), vaultline.UNKNOWN)
+        self.assertEqual(r.pending("REGISTRAR"), "new-value")
+        self.assertEqual(r.secrets["REGISTRAR"], "old-value")
+
+    def test_both_failing_locks_out_and_deletes_nothing(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "unknown")
+        with self.assertRaises(vaultline.LockedOut):
+            self.v.verify("REGISTRAR", Verifier(False, False))
+        r = self.reopened()
+        self.assertEqual(r.rotation_state("REGISTRAR"), vaultline.LOCKED_OUT)
+        self.assertEqual(r.pending("REGISTRAR"), "new-value")
+        self.assertEqual(r.rotation("REGISTRAR")["previous"], "old-value")
+        self.assertEqual(r.secrets["REGISTRAR"], "old-value")
+
+    def test_the_vault_asks_the_candidate_first(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.v.record_outcome("REGISTRAR", "accepted")
+        verifier = Verifier(True)
+        self.v.verify("REGISTRAR", verifier)
+        self.assertEqual(verifier.asked, ["new-value"])
+
+    def test_verification_before_classification_is_refused(self):
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        with self.assertRaises(vaultline.RotationError):
+            self.v.verify("REGISTRAR", Verifier(True))
+
+    # -- retry limits ----------------------------------------------------
+
+    def test_attempts_are_counted_and_persisted(self):
+        self.v.begin_rotation("REGISTRAR", "new-value", max_attempts=4)
+        self.v.record_outcome("REGISTRAR", "unknown")
+        self.v.verify("REGISTRAR", Verifier(None))
+        self.assertEqual(self.reopened().rotation("REGISTRAR")["attempts"], 1)
+        self.assertEqual(self.reopened().attempts_remaining("REGISTRAR"), 3)
+
+    def test_verification_stops_rather_than_risking_lockout(self):
+        # A wrong guess can lock an account, so exhausting the budget must
+        # stop the tool rather than let it keep trying.
+        self.v.begin_rotation("REGISTRAR", "new-value", max_attempts=2)
+        self.v.record_outcome("REGISTRAR", "unknown")
+        self.v.verify("REGISTRAR", Verifier(None))
+        self.v.verify("REGISTRAR", Verifier(None))
+        self.assertEqual(self.v.attempts_remaining("REGISTRAR"), 0)
+        with self.assertRaises(vaultline.RotationError):
+            self.v.verify("REGISTRAR", Verifier(True))
+
+    def test_it_will_not_test_the_previous_value_without_budget(self):
+        # Falling back to the old value is itself an attempt.
+        self.v.begin_rotation("REGISTRAR", "new-value", max_attempts=1)
+        self.v.record_outcome("REGISTRAR", "unknown")
+        with self.assertRaises(vaultline.RotationError):
+            self.v.verify("REGISTRAR", Verifier(False, True))
+        self.assertEqual(self.reopened().pending("REGISTRAR"), "new-value")
+
+    # -- the work list ---------------------------------------------------
+
+    def test_mid_rotation_lists_what_is_in_flight(self):
+        self.v.secrets["MAILBOX"] = "m"
+        self.v.begin_rotation("REGISTRAR", "new-value")
+        self.assertEqual(list(self.v.mid_rotation()), ["REGISTRAR"])
+        self.v.record_outcome("REGISTRAR", "rejected")
+        self.assertEqual(self.v.mid_rotation(), {})
+
+
+class PayloadTests(VaultCase):
+    def test_a_version_0_bare_mapping_still_opens(self):
+        # Files written before the payload became a document must not become
+        # unreadable, or the format has broken its own promise once already.
+        self.make(secrets={"A": "1"})
+        v = vaultline.Vault.open(self.path, PASS)
+        legacy = json.dumps({"A": "1"}).encode("utf-8")
+        env = json.loads(self.path.read_text(encoding="utf-8"))
+        env["payload"] = vaultline._encrypt(legacy, v._master)
+        self.path.write_text(json.dumps(env), encoding="utf-8")
+
+        reopened = vaultline.Vault.open(self.path, PASS)
+        self.assertEqual(reopened.secrets, {"A": "1"})
+        self.assertEqual(reopened.rotations, {})
+
+    def test_a_future_payload_version_is_refused(self):
+        self.make()
+        v = vaultline.Vault.open(self.path, PASS)
+        future = json.dumps({"payload_version": vaultline.PAYLOAD_VERSION + 1,
+                             "secrets": {}}).encode("utf-8")
+        env = json.loads(self.path.read_text(encoding="utf-8"))
+        env["payload"] = vaultline._encrypt(future, v._master)
+        self.path.write_text(json.dumps(env), encoding="utf-8")
+        with self.assertRaises(vaultline.BadEnvelope):
+            vaultline.Vault.open(self.path, PASS)
+
+    def test_rotation_state_is_inside_the_encryption(self):
+        self.make(secrets={"REGISTRAR": "old"})
+        v = vaultline.Vault.open(self.path, PASS)
+        v.begin_rotation("REGISTRAR", "a-distinctive-candidate")
+        raw = self.path.read_text(encoding="utf-8")
+        self.assertNotIn("a-distinctive-candidate", raw)
+        self.assertNotIn("REGISTRAR", raw)
+
+
 class VersionTests(unittest.TestCase):
     def test_version_is_a_string(self):
         self.assertIsInstance(vaultline.__version__, str)
