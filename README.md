@@ -93,9 +93,14 @@ finder how to open it while telling them nothing about what is inside.
 
 ## Dependencies
 
-None, in the Python sense. `gpg` must be on PATH - it ships with Git, and with
-every Linux distribution - and key stretching uses `hashlib.scrypt`, which is
-standard library.
+None, in the Python sense. `gpg` must be findable, and key stretching uses
+`hashlib.scrypt`, which is standard library.
+
+GPG ships with Git and with every Linux distribution. On Windows there is a
+catch worth knowing: Git adds it to PATH **only inside Git Bash**, so a
+PowerShell or cmd session will not see it. vaultline therefore looks on PATH
+first, then in the usual install locations, and you can point it anywhere with
+`VAULTLINE_GPG`. If none of that works it says so, and says what to do.
 
 GPG's own S2K is not memory-hard, so the passphrase is stretched with scrypt
 first and GPG only ever sees a high-entropy string. The parameters are recorded

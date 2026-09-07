@@ -549,6 +549,68 @@ class PayloadTests(VaultCase):
         self.assertNotIn("REGISTRAR", raw)
 
 
+class GpgPathTests(unittest.TestCase):
+    """Finding gpg. This is not incidental plumbing.
+
+    GPG ships with Git, but Git adds it to PATH only inside Git Bash - so the
+    library worked in one shell and failed in the one most people use, with an
+    error that said only "the system cannot find the file specified". Silent
+    environment differences are exactly the failure mode worth a test.
+    """
+
+    def setUp(self):
+        import os
+
+        self._saved = os.environ.pop("VAULTLINE_GPG", None)
+
+    def tearDown(self):
+        import os
+
+        os.environ.pop("VAULTLINE_GPG", None)
+        if self._saved is not None:
+            os.environ["VAULTLINE_GPG"] = self._saved
+
+    def test_it_finds_something_that_exists(self):
+        if not gpg_available():
+            self.skipTest("gpg is not installed at all")
+        self.assertTrue(pathlib.Path(vaultline.gpg_path()).exists())
+
+    def test_an_override_is_honoured(self):
+        import os
+
+        os.environ["VAULTLINE_GPG"] = sys.executable
+        self.assertEqual(vaultline.gpg_path(), sys.executable)
+
+    def test_an_override_pointing_nowhere_says_so(self):
+        import os
+
+        os.environ["VAULTLINE_GPG"] = str(pathlib.Path(tempfile.gettempdir()) / "nope.exe")
+        with self.assertRaises(vaultline.VaultlineError) as caught:
+            vaultline.gpg_path()
+        self.assertIn("VAULTLINE_GPG", str(caught.exception))
+
+    def test_the_not_found_message_is_actionable(self):
+        # An error that names the fix is the difference between a five-minute
+        # problem and an afternoon.
+        import os
+        import shutil
+
+        real_which = shutil.which
+        shutil.which = lambda *a, **k: None
+        real_fallbacks = vaultline.GPG_FALLBACKS
+        vaultline.GPG_FALLBACKS = ()
+        try:
+            os.environ.pop("VAULTLINE_GPG", None)
+            with self.assertRaises(vaultline.VaultlineError) as caught:
+                vaultline.gpg_path()
+            message = str(caught.exception)
+            self.assertIn("VAULTLINE_GPG", message)
+            self.assertIn("Git Bash", message)
+        finally:
+            shutil.which = real_which
+            vaultline.GPG_FALLBACKS = real_fallbacks
+
+
 class VersionTests(unittest.TestCase):
     def test_version_is_a_string(self):
         self.assertIsInstance(vaultline.__version__, str)

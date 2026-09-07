@@ -146,11 +146,59 @@ def stretch(passphrase, salt, params=None):
     return base64.b64encode(key).decode("ascii")
 
 
+#: Where to look for gpg when it is not on PATH.
+#:
+#: On Windows this matters more than it should. GPG ships with Git, but Git
+#: adds its bin directory to PATH only inside Git Bash - so the tool works in
+#: one shell and fails in the one most people actually use, with an error that
+#: says only "the system cannot find the file specified". These are product
+#: install locations rather than machine-specific paths, and they are tried
+#: after PATH, never instead of it.
+GPG_FALLBACKS = (
+    r"C:\Program Files\Git\usr\bin\gpg.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\gpg.exe",
+    r"C:\Program Files\GnuPG\bin\gpg.exe",
+    r"C:\Program Files (x86)\GnuPG\bin\gpg.exe",
+)
+
+
+def gpg_path():
+    """Locate the gpg binary, or say clearly what to do about it.
+
+    Order: an explicit override, then PATH, then known install locations. The
+    override exists so a machine with an unusual layout has an answer that
+    does not involve editing this file.
+    """
+    import os
+    import pathlib as _pathlib
+    import shutil
+
+    override = os.environ.get("VAULTLINE_GPG")
+    if override:
+        if not _pathlib.Path(override).exists():
+            raise VaultlineError(
+                "VAULTLINE_GPG is set to %r, which does not exist" % override)
+        return override
+    found = shutil.which("gpg")
+    if found:
+        return found
+    for candidate in GPG_FALLBACKS:
+        if _pathlib.Path(candidate).exists():
+            return candidate
+    raise VaultlineError(
+        "gpg was not found on PATH.\n"
+        "  It ships with Git, but Git adds it to PATH only inside Git Bash,\n"
+        "  so a PowerShell or cmd session will not see it.\n"
+        "  Either add its directory to PATH, or set VAULTLINE_GPG to the full\n"
+        "  path of gpg.exe - commonly inside the Git installation, under\n"
+        "  usr/bin.")
+
+
 def _gpg(args, data=None, passphrase=None):
     """Run gpg as a subprocess. It is never imported and never long-lived."""
     import subprocess
 
-    argv = ["gpg", "--batch", "--yes", "--quiet"]
+    argv = [gpg_path(), "--batch", "--yes", "--quiet"]
     if passphrase is not None:
         argv += ["--pinentry-mode", "loopback", "--passphrase-fd", "0"]
         data = passphrase.encode("utf-8") + b"\n" + (data or b"")
