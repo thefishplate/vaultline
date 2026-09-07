@@ -105,7 +105,29 @@ budget is enforced and persisted before each attempt — a crash mid-attempt mus
 still count it. Falling back to test the previous value spends from the same
 budget, and when it is exhausted the tool stops.
 
-## 7. Not built
+## 7. The clipboard tier
+
+The only implemented way of getting a credential into somewhere that wants one.
+The tool holds the value and the operator pastes it: no browser is driven, no
+form is filled, and nothing happens that a service could reasonably object to.
+
+`to_clipboard()` blocks for the duration rather than scheduling a background
+clear, because a background timer does not survive process exit - a call that
+copied and returned would leave the value on the clipboard while appearing to
+have tidied up, which is the worst of both. Ctrl-C brings the clear forward.
+
+The clear is guarded: if the clipboard no longer holds what was put there, it
+is left alone. Wiping the operator's own clipboard to tidy up after ourselves
+would be its own small betrayal.
+
+**What this tier does not do.** The clipboard is readable by every process
+running as the operator. On Windows, clipboard history keeps the value in Win+V
+after the clipboard is emptied, and cloud sync will have copied it to other
+machines. `clipboard_history_enabled()` detects both and the tool warns, but it
+cannot undo them. A timed clear that removes nothing is worse than none,
+because it buys confidence without buying safety.
+
+## 8. Not built
 
 - **Threshold recovery.** A quorum wrapping alongside the passphrase one. The
   format is built for it; the policy around it - threshold, holders, what
@@ -113,7 +135,7 @@ budget, and when it is exhausted the tool stops.
   about people and cannot sensibly be fixed before there are any.
 - **Adapters, and any command-line interface.**
 
-## 8. Open
+## 9. Open
 
 - The threshold, when threshold recovery is built. Expensive to change once
   material has been distributed to holders.

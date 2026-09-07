@@ -52,6 +52,43 @@ into retiring a working credential.
 a verification budget is enforced and falling back to test the old value spends
 from it. When the budget runs out the tool stops rather than trying once more.
 
+## Getting a credential into a login form
+
+The lowest-risk option, and the only one implemented: the tool holds the value,
+you paste it.
+
+```python
+v.to_clipboard("REGISTRAR")        # blocks, counts down, takes it back
+```
+
+```
+  REGISTRAR is on the clipboard. Paste it now.
+  clearing in 24s   Ctrl-C to clear now
+  cleared.
+```
+
+No browser is driven and no form is filled, so there is nothing here a service
+could object to - while the part that actually hurts, finding and retyping a
+long random string, is gone.
+
+Three details that are not incidental:
+
+- **It blocks.** A background timer does not survive the process exiting, so a
+  call that copied and returned would leave the value on the clipboard
+  indefinitely while appearing to have cleaned up. Ctrl-C clears early rather
+  than skipping the clear.
+- **It will not wipe something you copied since.** If the clipboard has changed
+  it is left alone, and it says so.
+- **The value is never printed, returned or logged.** What comes back is what
+  happened, not what was copied.
+
+> **The clear is a courtesy, not a control.** Any process running as you can
+> read the clipboard at any moment. On Windows, if clipboard history is on the
+> value stays in Win+V after the clipboard is emptied, and if cloud sync is on
+> it has already left the machine. vaultline checks and warns, because a timed
+> clear that removes nothing is worse than no clear at all - it buys confidence
+> without buying safety.
+
 ## The two properties
 
 **Re-wrapping is not re-encryption.** Granting or withdrawing a way in encrypts
@@ -109,18 +146,22 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** Implemented and covered by 56 tests: the envelope, wrappings,
-saving, location safety, and the rotation state machine. Not implemented:
-threshold recovery, adapters, and any command-line interface.
+**Pre-alpha.** Implemented and covered by 67 tests: the envelope, wrappings,
+saving, location safety, the rotation state machine, and the clipboard tier.
+Not implemented: adapters that talk to services, threshold recovery, and any
+command-line interface.
 
 Nothing is published to PyPI yet.
 
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 56 tests, about a minute
+python vaultline_dev.py             # 67 tests
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
+
+Clipboard tests skip where there is no clipboard, so a headless runner reports
+them as skipped rather than passing without having tested anything.
 
 Nearly all of that minute is GPG subprocesses. The rotation tests are slow
 because the state machine saves at each step, and each save encrypts and then

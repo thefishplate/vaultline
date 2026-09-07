@@ -17,8 +17,18 @@
       fall-back test of the previous value spends from it.
 - [x] Versioned payload document, with the version 0 bare mapping still read.
 
+- [x] **The clipboard tier.** Blocking countdown, guarded clear, clipboard
+      history detection on Windows.
+- [x] **gpg discovery** outside Git Bash, with an actionable error.
+
 ## Next
 
+- [ ] **Verifiers for documented services.** `(value) -> True | False | None`.
+      Read-only calls to published endpoints: sanctioned, safe, and the thing
+      the rotation machinery already needs. This makes `verify()` real.
+- [ ] **Rotators for documented services.** Prefer create-then-revoke over
+      change-in-place: with tokens the new credential can be verified working
+      before the old one dies, and the ambiguous window closes entirely.
 - [ ] **A command-line interface**: list, get, set, hint, verify, rotate.
 - [ ] **An emergency sheet**, and a refusal to call a rotation complete until
       it has been regenerated. A stale sheet that looks authoritative is worse
@@ -39,6 +49,9 @@
 - **Withdrawal is not revocation.** Removing a wrapping affects only copies made
   afterwards. Only rotating the secret closes the door on older copies.
 - **Plaintext cannot be reliably erased from memory** in a managed runtime.
+- **The clipboard is readable by any process running as you**, and the timed
+  clear does not remove anything Windows has already put in clipboard history
+  or synced to another device. vaultline warns; it cannot fix this.
 - **The suite is slow** - about a minute, nearly all of it GPG subprocesses.
   The rotation tests save at each step and every save verifies by decrypting,
   which is the behaviour under test rather than overhead to remove.

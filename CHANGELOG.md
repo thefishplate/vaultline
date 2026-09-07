@@ -15,6 +15,13 @@ particular release.
 ## [Unreleased]
 
 ### Added
+- **The clipboard tier.** `Vault.to_clipboard(name)` puts a value on the
+  clipboard, blocks with a countdown, then takes it back. It blocks because a
+  background timer does not survive the process exiting; it refuses to wipe
+  something copied since; and it warns when Windows clipboard history is on,
+  since the clear then removes nothing that mattered.
+- `gpg_path()`, which looks on PATH, then the usual install locations, and
+  names `VAULTLINE_GPG` and the Git Bash PATH quirk when it cannot find one.
 - **The rotation state machine.** `begin_rotation`, `record_outcome`, `verify`,
   with `unknown` as a first-class outcome that keeps both values rather than
   discarding the candidate. The candidate is written to disk before it is
@@ -32,7 +39,7 @@ particular release.
 - scrypt stretching ahead of GPG, with parameters recorded per wrapping.
 - Refusal to operate beneath a folder that looks like a sync root.
 - Verify-then-swap saving, with a `.bak` retained.
-- 56 tests, including one asserting that adding a wrapping leaves the payload
+- 67 tests, including one asserting that adding a wrapping leaves the payload
   byte-identical, and one asserting that an older copy still opens after a
   wrapping has been removed.
 

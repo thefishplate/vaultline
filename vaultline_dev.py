@@ -549,6 +549,90 @@ class PayloadTests(VaultCase):
         self.assertNotIn("REGISTRAR", raw)
 
 
+class ClipboardTests(VaultCase):
+    """The lowest-risk way to get a credential into a login form.
+
+    Skipped where there is no clipboard - a headless CI runner has none, and
+    pretending otherwise would make these tests lie rather than skip.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not vaultline.clipboard_available():
+            self.skipTest("no clipboard tool on this platform")
+        self.make(secrets={"REGISTRAR": "s3cr3t-not-real"})
+        self.v = vaultline.Vault.open(self.path, PASS)
+
+    def _run(self, name="REGISTRAR", seconds=3, during=None):
+        """Drive to_clipboard on a fake clock.
+
+        `during` is called on each tick, for tests that need something to
+        happen mid-countdown. The clock advances regardless of what `during`
+        does - an earlier version let a hook replace the tick entirely, which
+        froze the fake clock and hung the countdown forever. A fake that can
+        stop time is a fake that can hang the suite.
+        """
+        clock = [0.0]
+        out = []
+
+        def tick(seconds_to_sleep):
+            clock[0] += seconds_to_sleep
+            if during is not None:
+                during()
+
+        result = self.v.to_clipboard(
+            name, seconds=seconds, announce=out.append,
+            sleep=tick, now=lambda: clock[0])
+        return result, "".join(out)
+
+    def test_the_value_reaches_the_clipboard_and_is_taken_back(self):
+        result, _ = self._run()
+        self.assertTrue(result["cleared"])
+        self.assertFalse((vaultline.clipboard_read() or "").strip())
+
+    def test_the_value_is_never_printed_or_returned(self):
+        # The whole point of the clipboard tier is that the value does not go
+        # through the terminal, where it would sit in scrollback.
+        result, shown = self._run()
+        self.assertNotIn("s3cr3t-not-real", shown)
+        self.assertNotIn("s3cr3t-not-real", str(result))
+
+    def test_an_interrupt_still_clears(self):
+        # Ctrl-C must bring the clear forward, not skip it. KeyboardInterrupt
+        # is a BaseException, so this is easy to get wrong.
+        def interrupt():
+            raise KeyboardInterrupt
+
+        result, _ = self._run(during=interrupt)
+        self.assertTrue(result["interrupted"])
+        self.assertTrue(result["cleared"])
+        self.assertFalse((vaultline.clipboard_read() or "").strip())
+
+    def test_something_you_copied_since_is_left_alone(self):
+        # Wiping the operator's own clipboard to tidy up after ourselves would
+        # be its own small betrayal.
+        result, shown = self._run(
+            during=lambda: vaultline.clipboard_write("something the operator copied"))
+        self.assertFalse(result["cleared"])
+        self.assertEqual(vaultline.clipboard_read(), "something the operator copied")
+        self.assertIn("left alone", shown)
+
+    def test_an_unknown_name_is_refused_before_anything_is_copied(self):
+        with self.assertRaises(vaultline.VaultlineError):
+            self.v.to_clipboard("NOT_A_SECRET", seconds=1)
+
+    def test_the_guarded_clear_refuses_when_the_contents_changed(self):
+        vaultline.clipboard_write("mine")
+        self.assertFalse(vaultline.clipboard_clear(only_if="not mine"))
+        self.assertEqual(vaultline.clipboard_read(), "mine")
+        self.assertTrue(vaultline.clipboard_clear(only_if="mine"))
+
+    def test_history_detection_answers_something_sensible(self):
+        # On Windows this decides whether the timed clear means anything at
+        # all; elsewhere there is no such feature.
+        self.assertIn(vaultline.clipboard_history_enabled(), (True, False, None))
+
+
 class GpgPathTests(unittest.TestCase):
     """Finding gpg. This is not incidental plumbing.
 

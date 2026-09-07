@@ -247,6 +247,141 @@ def refuse_sync_root(path, override=False):
                     "override=True if you are certain." % (str(path), part))
 
 
+# ---------------------------------------------------------------------------
+# The clipboard tier
+#
+# The lowest-risk way to put a credential into a login form: the tool holds the
+# value, you paste it. No browser is driven, no form is filled, nothing is
+# automated that a service could object to - and it removes the part that
+# actually hurts, which is finding and retyping a long random string.
+#
+# **The clear is a courtesy, not a control.** Any process running as you can
+# read the clipboard at any moment, and on Windows the clipboard can be kept in
+# a history and synced between devices. See clipboard_history_enabled().
+# ---------------------------------------------------------------------------
+
+
+def _clipboard_tools():
+    """(write_argv, read_argv, clear_argv) for this platform, or None."""
+    import shutil
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        ps = shutil.which("powershell") or shutil.which("pwsh")
+        clip = shutil.which("clip")
+        if ps:
+            return (
+                [ps, "-NoProfile", "-Command", "$input | Set-Clipboard"],
+                [ps, "-NoProfile", "-Command", "Get-Clipboard -Raw"],
+                # Set-Clipboard rejects an empty string, so clearing goes
+                # through clip.exe, which accepts empty input happily.
+                [clip] if clip else [ps, "-NoProfile", "-Command",
+                                     "Set-Clipboard -Value ' '"],
+            )
+        return None
+    if _sys.platform == "darwin":
+        if shutil.which("pbcopy") and shutil.which("pbpaste"):
+            return (["pbcopy"], ["pbpaste"], ["pbcopy"])
+        return None
+    for write, read in (("wl-copy", "wl-paste"), ("xclip", "xclip"), ("xsel", "xsel")):
+        if shutil.which(write) and shutil.which(read):
+            if write == "xclip":
+                return (["xclip", "-selection", "clipboard"],
+                        ["xclip", "-selection", "clipboard", "-o"],
+                        ["xclip", "-selection", "clipboard"])
+            if write == "xsel":
+                return (["xsel", "--clipboard", "--input"],
+                        ["xsel", "--clipboard", "--output"],
+                        ["xsel", "--clipboard", "--input"])
+            return (["wl-copy"], ["wl-paste", "-n"], ["wl-copy"])
+    return None
+
+
+def clipboard_available():
+    return _clipboard_tools() is not None
+
+
+def clipboard_write(value):
+    import subprocess
+
+    tools = _clipboard_tools()
+    if tools is None:
+        raise VaultlineError(
+            "no clipboard tool found. On Linux install xclip, xsel or wl-clipboard.")
+    r = subprocess.run(tools[0], input=value.encode("utf-8"), capture_output=True)
+    if r.returncode != 0:
+        raise VaultlineError("could not write to the clipboard: %s"
+                             % r.stderr.decode("utf-8", "replace").strip()[:200])
+
+
+def clipboard_read():
+    """Current clipboard text, or None if it cannot be read."""
+    import subprocess
+
+    tools = _clipboard_tools()
+    if tools is None:
+        return None
+    r = subprocess.run(tools[1], capture_output=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", "replace").rstrip("\r\n")
+
+
+def clipboard_clear(only_if=None):
+    """Empty the clipboard, optionally only when it still holds *only_if*.
+
+    The guard matters. Between putting a password on the clipboard and clearing
+    it, the operator has very likely copied something else - and wiping their
+    work to tidy up after ourselves would be its own small betrayal.
+    """
+    import subprocess
+
+    tools = _clipboard_tools()
+    if tools is None:
+        return False
+    if only_if is not None:
+        current = clipboard_read()
+        if current is not None and current != only_if:
+            return False
+    subprocess.run(tools[2], input=b"", capture_output=True)
+    return True
+
+
+def clipboard_history_enabled():
+    """Whether Windows is keeping a clipboard history. None if not knowable.
+
+    This is the single most important thing to know before trusting a timed
+    clear. With history on, the value stays in Win+V after the clipboard is
+    emptied, and with cloud sync on it has already left the machine. The clear
+    then removes nothing that mattered.
+
+    Absent registry values mean the feature is off - it is opt-in.
+    """
+    import sys as _sys
+
+    if _sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Clipboard") as key:
+            history = _reg_dword(winreg, key, "EnableClipboardHistory")
+            cloud = _reg_dword(winreg, key, "CloudClipboardAutomaticUpload")
+            return bool(history) or bool(cloud)
+    except OSError:
+        return False
+    except ImportError:  # pragma: no cover - not Windows
+        return None
+
+
+def _reg_dword(winreg, key, name):
+    try:
+        return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return 0
+
+
 class Vault:
     """One vault file: a plaintext envelope around encrypted blobs.
 
@@ -617,6 +752,64 @@ class Vault:
     def mid_rotation(self):
         """Every secret not currently in a settled state. The work list."""
         return {n: r for n, r in self.rotations.items() if r["state"] != NONE}
+
+    # -- handing a value to the operator ---------------------------------
+
+    def to_clipboard(self, name, seconds=30, announce=None, sleep=None,
+                     now=None):
+        """Put a secret on the clipboard, wait, then take it back.
+
+        This **blocks** for the duration, and that is deliberate rather than
+        lazy. A background timer does not survive the process exiting, so a
+        one-liner that copied and returned would leave the value on the
+        clipboard indefinitely while appearing to have cleaned up - the worst
+        combination available. Blocking means the clear always happens, and
+        Ctrl-C brings it forward rather than skipping it.
+
+        The value is never printed, never returned, and never logged. What the
+        caller gets back is what happened, not what was copied.
+        """
+        import time as _time
+
+        if name not in self.secrets:
+            raise VaultlineError("no secret called %r" % name)
+        sleep = sleep or _time.sleep
+        now = now or _time.monotonic
+        announce = announce or (lambda text: print(text, end="", flush=True))
+
+        value = self.secrets[name]
+        clipboard_write(value)
+
+        history = clipboard_history_enabled()
+        if history:
+            announce(
+                "\n  WARNING: Windows clipboard history is on. Clearing the\n"
+                "  clipboard will not remove this from Win+V, and if cloud\n"
+                "  sync is on it has already left this machine.\n")
+
+        announce("\n  %s is on the clipboard. Paste it now.\n" % name)
+        deadline = now() + seconds
+        interrupted = False
+        try:
+            while True:
+                left = deadline - now()
+                if left <= 0:
+                    break
+                announce("\r  clearing in %2ds   Ctrl-C to clear now " % int(left + 0.5))
+                sleep(min(0.25, left))
+        except KeyboardInterrupt:
+            # KeyboardInterrupt is a BaseException, so an outer `except
+            # Exception` would not catch it - and the clear must happen.
+            interrupted = True
+
+        cleared = clipboard_clear(only_if=value)
+        announce("\r" + " " * 44 + "\r")
+        if cleared:
+            announce("  cleared.\n" if not interrupted else "  cleared early.\n")
+        else:
+            announce("  left alone - you copied something else since.\n")
+        return {"name": name, "cleared": cleared, "interrupted": interrupted,
+                "history_enabled": history}
 
     # -- the envelope, readable by anyone --------------------------------
 
