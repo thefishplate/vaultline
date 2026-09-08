@@ -15,6 +15,11 @@ particular release.
 ## [Unreleased]
 
 ### Added
+- **`GithubSshKeyAdapter`**, the first adapter against a published API:
+  create-then-revoke over `/user/keys`. A bad authorising token reports `None`
+  rather than `False`, because it says nothing about the key being asked
+  about. Personal access tokens are unsupported - GitHub has no endpoint that
+  creates one.
 - **Playbooks**: a declarative format for how to perform an operation at a
   site, with `validate_playbook()` and a pure `plan()`. The origin comes from
   the credential rather than the playbook, inventory keys are refused by name,
@@ -63,7 +68,7 @@ particular release.
 - scrypt stretching ahead of GPG, with parameters recorded per wrapping.
 - Refusal to operate beneath a folder that looks like a sync root.
 - Verify-then-swap saving, with a `.bak` retained.
-- 117 tests, including one asserting that adding a wrapping leaves the payload
+- 138 tests, including one asserting that adding a wrapping leaves the payload
   byte-identical, and one asserting that an older copy still opens after a
   wrapping has been removed.
 

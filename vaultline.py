@@ -783,6 +783,153 @@ class Adapter:
                                         self.sanction)
 
 
+class GithubSshKeyAdapter(Adapter):
+    """Rotate an SSH key registered against a GitHub account.
+
+    The first real adapter, and it exists because GitHub SSH keys are one of
+    the few credentials a published API will genuinely create *and* revoke:
+
+        POST   /user/keys          register a new key
+        DELETE /user/keys/{id}     withdraw an old one
+
+    That is create-then-revoke, which is the safe shape: the replacement can
+    be confirmed working before the incumbent is withdrawn, so the ambiguous
+    window the rotation machinery exists to survive never opens at all.
+
+    **Personal access tokens are deliberately not supported**, because GitHub
+    provides no endpoint that mints one - the `/orgs/*/personal-access-tokens`
+    routes are for org admins reviewing other people's. An API able to create
+    its own credentials would be an account-takeover primitive, so its absence
+    is a design decision rather than a gap. Rotating a PAT is manual work.
+
+    **The managed value is the public key.** The private half is stored in the
+    vault beside it and this adapter never sees it, which is a small piece of
+    luck worth keeping: the code that talks to the network has no access to the
+    secret it is rotating.
+
+    **`auth` is a different credential from the one being managed** - a token
+    carrying `admin:public_key`. It is the bootstrap credential, and it cannot
+    itself be rotated through any API, so it is the manual root of this whole
+    arrangement. Whatever else is automated, that one is yours to change by
+    hand, and it should be the most carefully held thing in the store.
+    """
+
+    name = "github.ssh_key"
+    sanction = "documented"
+    version = "2026.09"
+    API = "https://api.github.com"
+
+    def __init__(self, auth, transport=None):
+        super().__init__(transport=transport)
+        if not auth:
+            raise AdapterError(
+                "this adapter needs a token with admin:public_key to act at "
+                "all. It is a different credential from the key it manages.")
+        self._auth = auth
+
+    # -- plumbing --------------------------------------------------------
+
+    def _headers(self):
+        return {"Authorization": "Bearer %s" % self._auth,
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "vaultline"}
+
+    def _keys(self):
+        """Registered keys, or None if we could not find out.
+
+        The failure shapes here are about the **authorising token**, not the
+        key being asked about. A 401 means this adapter cannot see, not that
+        the key is absent - so it becomes None rather than False. Reporting
+        False would be reporting the wrong credential's problem as this one's.
+        """
+        response = self.transport.request("GET", self.API + "/user/keys",
+                                          headers=self._headers())
+        if response.status != 200:
+            return None
+        body = response.json()
+        if not isinstance(body, list):
+            return None                    # 200 of a shape we do not know
+        return body
+
+    @staticmethod
+    def _material(public_key):
+        """The type and base64 body, without the trailing comment.
+
+        GitHub stores keys without the comment, and a comment differing is not
+        a different key. Comparing whole strings would report a key as absent
+        because somebody renamed their laptop.
+        """
+        parts = (public_key or "").split()
+        if len(parts) < 2 or not parts[0].startswith(("ssh-", "ecdsa-", "sk-")):
+            raise AdapterError("that does not look like an SSH public key")
+        return "%s %s" % (parts[0], parts[1])
+
+    # -- the contract ----------------------------------------------------
+
+    def verify(self, value):
+        """Is this public key registered on the account?
+
+        Registered, note - not *working*. Proving that SSH authentication
+        succeeds means running ssh, which is outside this transport and would
+        need its own injection point. The gap is real and is stated here rather
+        than assumed away: a key can be present and still be refused, for
+        instance if the account has SSH certificate policies in force.
+        """
+        wanted = self._material(value)
+        keys = self._keys()
+        if keys is None:
+            return None
+        return any(self._material(k.get("key", "")) == wanted
+                   for k in keys if k.get("key"))
+
+    def submit(self, new_value, title="vaultline"):
+        """Register a new key. Returns an outcome for the vault to classify.
+
+        Never a verdict - `accepted` means GitHub took the request, and
+        whether the key is in force is decided by verify(), not here.
+        """
+        import json as _json
+
+        self._material(new_value)          # fail closed on nonsense
+        body = _json.dumps({"title": title, "key": new_value}).encode("utf-8")
+        try:
+            response = self.transport.request(
+                "POST", self.API + "/user/keys",
+                headers=dict(self._headers(), **{"Content-Type": "application/json"}),
+                body=body)
+        except TransportError:
+            return "unknown"               # it may or may not have arrived
+        if response.status in (200, 201):
+            return "accepted"
+        if response.status in (422, 400):
+            return "rejected"              # refused before being applied
+        return "unknown"
+
+    def revoke(self, value):
+        """Withdraw a key. Only ever called after a replacement is verified.
+
+        Returns True when GitHub confirms it is gone, False when the key was
+        not there to withdraw, and None when we could not tell - which must
+        not be read as success, because a key still registered is still a way
+        in.
+        """
+        wanted = self._material(value)
+        keys = self._keys()
+        if keys is None:
+            return None
+        for key in keys:
+            if key.get("key") and self._material(key["key"]) == wanted:
+                try:
+                    response = self.transport.request(
+                        "DELETE", "%s/user/keys/%s" % (self.API, key["id"]),
+                        headers=self._headers())
+                except TransportError:
+                    return None
+                return True if response.status == 204 else None
+        return False                       # not registered; nothing to revoke
+
+
 # ---------------------------------------------------------------------------
 # The clipboard tier
 #

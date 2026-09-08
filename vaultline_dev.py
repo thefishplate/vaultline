@@ -691,6 +691,18 @@ class AdapterContract:
     def adapter(self):
         raise NotImplementedError
 
+    def read_only_adapter(self):
+        """The same adapter, unable to change anything.
+
+        Overridable, because a real adapter takes constructor arguments - an
+        authorising credential, usually - and the contract cannot know them.
+        Swapping the transport on the instance is enough and needs no
+        knowledge of how the thing is built.
+        """
+        adapter = self.adapter()
+        adapter.transport = vaultline.Transport(readonly=True)
+        return adapter
+
     def test_declares_a_sanction_and_a_name(self):
         a = self.adapter()
         self.assertIn(a.sanction, ("documented", "incidental", "unsanctioned"))
@@ -720,8 +732,7 @@ class AdapterContract:
         moment that helper starts mutating - which is exactly when you want to
         find out, rather than after it has run against a real account.
         """
-        adapter = type(self.adapter())(
-            transport=vaultline.Transport(readonly=True))
+        adapter = self.read_only_adapter()
         vaultline.arm("transport.request", "unauthorised")
         try:
             adapter.verify("a-token")
@@ -945,6 +956,156 @@ class PlanTests(unittest.TestCase):
             A_CREDENTIAL, candidate="x")
         for step in steps:
             self.assertIn(step["step"], ("open", "fill", "submit", "handoff"))
+
+
+KEY_A = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA one@laptop"
+KEY_B = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB two@laptop"
+
+
+class CannedTransport(vaultline.Transport):
+    """A transport that answers from a script, and records what it was asked.
+
+    The injection catalogue only produces failures - deliberately, so it can
+    never forge a success. Success paths therefore need an ordinary test
+    double, which is this.
+    """
+
+    def __init__(self, *responses, **kwargs):
+        super().__init__(**kwargs)
+        self.responses = list(responses)
+        self.calls = []
+
+    def _request(self, method, url, headers, body):
+        """Overrides the *inner* method, deliberately.
+
+        Overriding request() would sit above the read-only guard and the
+        injection point, silently disabling both for every test that uses this
+        double - which is how a guard ends up untested in exactly the paths
+        that exercise it. An earlier version did that, and a read-only test
+        passed a DELETE straight through.
+        """
+        self.calls.append((method, url, body))
+        if not self.responses:
+            raise AssertionError("unexpected request: %s %s" % (method, url))
+        nxt = self.responses.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+def a_response(status, payload=None):
+    body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+    return vaultline.Response(status, body)
+
+
+def keys_listing(*keys):
+    return a_response(200, [{"id": 100 + i, "key": k}
+                            for i, k in enumerate(keys)])
+
+
+class GithubAdapterTests(unittest.TestCase):
+    """The first adapter against a published API."""
+
+    def adapter(self, *responses):
+        return vaultline.GithubSshKeyAdapter("a-token",
+                                             transport=CannedTransport(*responses))
+
+    def test_it_declares_itself(self):
+        a = self.adapter()
+        self.assertEqual(a.sanction, "documented")
+        self.assertEqual(a.name, "github.ssh_key")
+
+    def test_it_refuses_to_exist_without_an_authorising_credential(self):
+        with self.assertRaises(vaultline.AdapterError):
+            vaultline.GithubSshKeyAdapter(None)
+
+    def test_a_registered_key_verifies(self):
+        self.assertIs(self.adapter(keys_listing(KEY_A)).verify(KEY_A), True)
+
+    def test_an_unregistered_key_does_not(self):
+        self.assertIs(self.adapter(keys_listing(KEY_B)).verify(KEY_A), False)
+
+    def test_a_differing_comment_is_still_the_same_key(self):
+        # Renaming a laptop must not report the key as absent.
+        renamed = KEY_A.rsplit(" ", 1)[0] + " one@desktop"
+        self.assertIs(self.adapter(keys_listing(renamed)).verify(KEY_A), True)
+
+    def test_a_bad_authorising_token_is_not_evidence_about_the_key(self):
+        """The subtle one.
+
+        A 401 says this adapter cannot see the account. It says nothing about
+        whether the key is registered - that is a different credential's
+        problem, and reporting False would be reporting it as this one's.
+        """
+        self.assertIsNone(self.adapter(a_response(401)).verify(KEY_A))
+
+    def test_a_two_hundred_of_the_wrong_shape_is_not_evidence(self):
+        self.assertIsNone(self.adapter(a_response(200, {"message": "hi"})).verify(KEY_A))
+
+    def test_nonsense_fails_closed(self):
+        with self.assertRaises(vaultline.AdapterError):
+            self.adapter(keys_listing(KEY_A)).verify("not a key at all")
+
+    # -- submit ----------------------------------------------------------
+
+    def test_a_created_key_is_accepted_not_active(self):
+        # "accepted" means GitHub took the request. Whether it is in force is
+        # verify()'s to say, and the vault's to conclude.
+        a = self.adapter(a_response(201, {"id": 1}))
+        self.assertEqual(a.submit(KEY_B), "accepted")
+
+    def test_a_refused_key_is_rejected(self):
+        self.assertEqual(self.adapter(a_response(422)).submit(KEY_B), "rejected")
+
+    def test_a_lost_connection_is_unknown_not_failure(self):
+        # It may or may not have arrived. Reading that as failure is how a
+        # credential the service now holds gets discarded.
+        a = self.adapter(vaultline.TransportError("connection reset"))
+        self.assertEqual(a.submit(KEY_B), "unknown")
+
+    def test_a_server_error_is_unknown(self):
+        self.assertEqual(self.adapter(a_response(500)).submit(KEY_B), "unknown")
+
+    def test_submit_sends_the_key_to_the_documented_endpoint(self):
+        transport = CannedTransport(a_response(201, {"id": 1}))
+        vaultline.GithubSshKeyAdapter("t", transport=transport).submit(KEY_B)
+        method, url, body = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://api.github.com/user/keys")
+        self.assertIn(KEY_B, body.decode("utf-8"))
+
+    # -- revoke ----------------------------------------------------------
+
+    def test_revoking_a_registered_key_deletes_it_by_id(self):
+        transport = CannedTransport(keys_listing(KEY_A), a_response(204))
+        a = vaultline.GithubSshKeyAdapter("t", transport=transport)
+        self.assertIs(a.revoke(KEY_A), True)
+        self.assertEqual(transport.calls[1][0], "DELETE")
+        self.assertTrue(transport.calls[1][1].endswith("/user/keys/100"))
+
+    def test_revoking_something_absent_reports_false_not_success(self):
+        self.assertIs(self.adapter(keys_listing(KEY_B)).revoke(KEY_A), False)
+
+    def test_an_unclear_delete_is_not_reported_as_revoked(self):
+        # A key still registered is still a way in. Only 204 is confirmation.
+        transport = CannedTransport(keys_listing(KEY_A), a_response(500))
+        a = vaultline.GithubSshKeyAdapter("t", transport=transport)
+        self.assertIsNone(a.revoke(KEY_A))
+
+    def test_it_cannot_revoke_through_a_read_only_transport(self):
+        # The listing is a GET and is allowed; the DELETE that follows is not.
+        transport = CannedTransport(keys_listing(KEY_A), readonly=True)
+        a = vaultline.GithubSshKeyAdapter("t", transport=transport)
+        with self.assertRaises(vaultline.ReadOnlyViolation):
+            a.revoke(KEY_A)
+        self.assertEqual([c[0] for c in transport.calls], ["GET"])
+
+
+class GithubAdapterContractTests(AdapterContract, unittest.TestCase):
+    """It must satisfy the same contract as every other adapter."""
+
+    def adapter(self):
+        return vaultline.GithubSshKeyAdapter("a-token")
 
 
 class MutatingVerifyAdapter(ReferenceAdapter):

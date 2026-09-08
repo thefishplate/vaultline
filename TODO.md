@@ -21,6 +21,7 @@
       history detection on Windows.
 - [x] **gpg discovery** outside Git Bash, with an actionable error.
 
+- [x] **First adapter**: GitHub SSH keys, create-then-revoke.
 - [x] **Playbook schema, validator and planner.** The decision layer, testable
       with no browser.
 - [x] **Read-only transport**, so rehearsing against a real account is a
@@ -37,6 +38,12 @@
 - [ ] **Rotators for documented services.** Prefer create-then-revoke over
       change-in-place: with tokens the new credential can be verified working
       before the old one dies, and the ambiguous window closes entirely.
+- [ ] **Confirm the adapter against the live API once**, with a token carrying
+      only `admin:public_key`, and record `last_verified`. Until then it is
+      provably well-behaved and unproven-correct.
+- [ ] **`propose()`**: generate an SSH keypair via ssh-keygen. Left out
+      deliberately - a private key on disk needs its own careful pass over
+      permissions and deletion, and bundling it here would have rushed it.
 - [ ] **The password-rules parser and candidate generator**, over Apple's
       MIT-licensed `password-rules.json`. Bracket-aware: character classes
       contain semicolons and commas, so splitting on them silently produces
@@ -64,6 +71,9 @@
 
 ## Known limits
 
+- **`verify` proves a key is registered, not that SSH authentication works.**
+  Proving the latter means running ssh, which is outside the transport and
+  would need its own injection point.
 - **Withdrawal is not revocation.** Removing a wrapping affects only copies made
   afterwards. Only rotating the secret closes the door on older copies.
 - **Plaintext cannot be reliably erased from memory** in a managed runtime.

@@ -52,6 +52,32 @@ into retiring a working credential.
 a verification budget is enforced and falling back to test the old value spends
 from it. When the budget runs out the tool stops rather than trying once more.
 
+## The first adapter
+
+`GithubSshKeyAdapter` rotates an SSH key on a GitHub account, because those are
+one of the few credentials a published API will both create and revoke:
+
+```
+POST   /user/keys        register a replacement
+DELETE /user/keys/{id}   withdraw the incumbent
+```
+
+That ordering is the safe one: the replacement is confirmed working before the
+incumbent is withdrawn, so the ambiguous window never opens.
+
+**Personal access tokens are deliberately unsupported.** GitHub has no endpoint
+that mints one - the `/orgs/*/personal-access-tokens` routes are for org admins
+reviewing other people's. An API able to create its own credentials would be an
+account-takeover primitive, so the absence is a decision, not a gap. Rotating a
+PAT is manual work.
+
+Which exposes something structural: **the credential that authorises rotation
+cannot rotate itself.** This adapter needs a token carrying
+`admin:public_key`, and that token has no API path of its own. Every automated
+rotation scheme has a manual root, and it is usually the most privileged thing
+in the store. Two consequences: the clipboard tier is permanent rather than a
+stepping stone, and the root deserves to be marked as such.
+
 ## Playbooks
 
 How to perform an operation at a site, expressed as data rather than code:
@@ -279,7 +305,7 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** Implemented and covered by 117 tests: the envelope, wrappings,
+**Pre-alpha.** Implemented and covered by 138 tests: the envelope, wrappings,
 saving, location safety, the rotation state machine, the clipboard tier, and
 the transport with its fault injection and adapter contract. Not implemented:
 any real adapter, threshold recovery, and any command-line interface.
@@ -289,7 +315,7 @@ Nothing is published to PyPI yet.
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 117 tests
+python vaultline_dev.py             # 138 tests
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
 
