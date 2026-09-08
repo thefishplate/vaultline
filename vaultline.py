@@ -56,9 +56,23 @@ FORMAT = "vaultline"
 FORMAT_VERSION = 0
 
 #: The payload is a document, not a bare mapping, so that rotation state lives
-#: inside the encryption alongside the values it describes. Version 0 was a
-#: bare {name: value} mapping and is still read; it upgrades on the next save.
-PAYLOAD_VERSION = 1
+#: inside the encryption alongside the values it describes.
+#:
+#: Version 0 was a bare {name: value} mapping. Version 1 wrapped it in a
+#: document. Version 2 makes each secret a record, so a value can carry the
+#: facts something needs in order to act on it - chiefly its origin, without
+#: which a playbook cannot be checked against anything. All three are still
+#: read, and upgrade on the next save.
+PAYLOAD_VERSION = 2
+
+#: What a secret record may carry beside its value. Closed, and unknown keys
+#: are refused: metadata that silently does nothing is worse than none, because
+#: it reads as configuration.
+#:
+#: `root` marks a credential that authorises rotation of others and therefore
+#: cannot be rotated by any API - the manual root every such scheme has. It is
+#: recorded so it can be seen rather than remembered.
+SECRET_FIELDS = ("origin", "adapter", "last_verified", "notes", "root")
 
 #: Rotation states. The one that matters is UNKNOWN.
 #:
@@ -1074,11 +1088,17 @@ class Vault:
     """
 
     def __init__(self, path, envelope, master_key, secrets, payload=None,
-                 rotations=None):
+                 rotations=None, meta=None):
         self.path = path
         self.envelope = envelope
         self._master = master_key
+        #: name -> value. The common case, and deliberately still a plain
+        #: mapping of strings: almost every use is "give me the value".
         self.secrets = secrets
+        #: name -> the rest of the record. Kept beside rather than inside, so
+        #: that reading a value stays one subscript. They are zipped together
+        #: on save, which is the single source of truth for both.
+        self.meta = dict(meta or {})
         self.rotations = dict(rotations or {})
         # The payload ciphertext as it currently stands on disk, and a snapshot
         # of what it decrypts to. Together they let save() tell whether the
@@ -1088,9 +1108,15 @@ class Vault:
 
     def _document(self):
         """The decrypted payload, as it is written."""
+        records = {}
+        for name, value in self.secrets.items():
+            record = {"value": value}
+            record.update({k: v for k, v in (self.meta.get(name) or {}).items()
+                           if v is not None})
+            records[name] = record
         return {
             "payload_version": PAYLOAD_VERSION,
-            "secrets": self.secrets,
+            "secrets": records,
             "rotations": self.rotations,
         }
 
@@ -1101,22 +1127,39 @@ class Vault:
 
     @staticmethod
     def _parse_document(raw):
-        """Read a payload document, accepting the version 0 bare mapping.
+        """Read a payload document, accepting every version written so far.
 
-        Returns (secrets, rotations). A version this reader does not know is
-        refused rather than partially understood: silently ignoring a field it
-        cannot interpret is how a half-finished rotation gets lost.
+        Returns (values, meta, rotations). A version this reader does not know
+        is refused rather than partially understood: silently ignoring a field
+        it cannot interpret is how a half-finished rotation gets lost.
         """
         if not isinstance(raw, dict):
             raise BadEnvelope("payload is not an object")
         if "payload_version" not in raw:
-            return dict(raw), {}          # version 0: a bare mapping
+            return dict(raw), {}, {}                 # v0: a bare mapping
         version = raw.get("payload_version")
         if not isinstance(version, int) or version > PAYLOAD_VERSION:
             raise BadEnvelope(
                 "payload is version %r; this reader understands up to %d and "
                 "will not guess" % (version, PAYLOAD_VERSION))
-        return dict(raw.get("secrets") or {}), dict(raw.get("rotations") or {})
+        rotations = dict(raw.get("rotations") or {})
+        secrets = dict(raw.get("secrets") or {})
+        if version < 2:
+            return secrets, {}, rotations            # v1: name -> value
+        values, meta = {}, {}
+        for name, record in secrets.items():
+            if not isinstance(record, dict) or "value" not in record:
+                raise BadEnvelope("secret %r has no value" % name)
+            values[name] = record["value"]
+            rest = {k: v for k, v in record.items() if k != "value"}
+            unknown = set(rest) - set(SECRET_FIELDS)
+            if unknown:
+                raise BadEnvelope(
+                    "secret %r carries unknown fields: %s. Refusing rather "
+                    "than dropping them." % (name, ", ".join(sorted(unknown))))
+            if rest:
+                meta[name] = rest
+        return values, meta, rotations
 
     # -- construction ----------------------------------------------------
 
@@ -1179,12 +1222,12 @@ class Vault:
 
         payload = envelope.get("payload")
         if payload:
-            secrets, rotations = cls._parse_document(
+            secrets, meta, rotations = cls._parse_document(
                 json.loads(_decrypt(payload, master).decode("utf-8")))
         else:
-            secrets, rotations = {}, {}
+            secrets, meta, rotations = {}, {}, {}
         return cls(path, envelope, master, secrets, payload=payload,
-                   rotations=rotations)
+                   rotations=rotations, meta=meta)
 
     @staticmethod
     def _check_envelope(envelope):
@@ -1272,9 +1315,12 @@ class Vault:
 
         check = json.loads(tmp.read_text(encoding="utf-8"))
         self._check_envelope(check)
-        back_secrets, back_rotations = self._parse_document(
+        back_secrets, back_meta, back_rotations = self._parse_document(
             json.loads(_decrypt(check["payload"], self._master).decode("utf-8")))
-        if back_secrets != self.secrets or back_rotations != self.rotations:
+        expected_meta = {k: v for k, v in self.meta.items()
+                         if k in self.secrets and v}
+        if (back_secrets != self.secrets or back_rotations != self.rotations
+                or back_meta != expected_meta):
             tmp.unlink(missing_ok=True)
             raise VaultlineError(
                 "ABORT - the file read back with %d secrets and %d rotations, "
@@ -1291,6 +1337,52 @@ class Vault:
         self._payload = envelope["payload"]
         self._clean = document
         return backup
+
+    def set_meta(self, name, **fields):
+        """Record facts about a secret: its origin, which adapter owns it.
+
+        Unknown fields are refused rather than stored. Metadata that silently
+        does nothing is worse than none, because it reads as configuration and
+        somebody will later rely on it.
+        """
+        if name not in self.secrets:
+            raise VaultlineError("no secret called %r" % name)
+        unknown = set(fields) - set(SECRET_FIELDS)
+        if unknown:
+            raise VaultlineError(
+                "unknown fields for %r: %s; known: %s"
+                % (name, ", ".join(sorted(unknown)), ", ".join(SECRET_FIELDS)))
+        record = dict(self.meta.get(name) or {})
+        for key, value in fields.items():
+            if value is None:
+                record.pop(key, None)
+            else:
+                record[key] = value
+        if record:
+            self.meta[name] = record
+        else:
+            self.meta.pop(name, None)
+        return record
+
+    def credential(self, name):
+        """The record a planner needs, carrying no secret values.
+
+        This is what crosses the boundary into plan(): where the credential
+        lives and what the vault holds for it, but never the values
+        themselves. A plan built from this cannot leak one.
+        """
+        if name not in self.secrets:
+            raise VaultlineError("no secret called %r" % name)
+        record = dict(self.meta.get(name) or {})
+        record["name"] = name
+        record["has_current"] = bool(self.secrets.get(name))
+        record["has_totp"] = bool(self.secrets.get(name + "_TOTP")
+                                  or self.secrets.get(name + "_totp"))
+        return record
+
+    def roots(self):
+        """Secrets marked as authorising rotation, which nothing can rotate."""
+        return sorted(n for n, m in self.meta.items() if (m or {}).get("root"))
 
     # -- rotation --------------------------------------------------------
     #

@@ -514,6 +514,119 @@ class RotationTests(VaultCase):
         self.assertEqual(self.v.mid_rotation(), {})
 
 
+class SecretRecordTests(VaultCase):
+    """Payload v2: a secret can carry the facts needed to act on it."""
+
+    def setUp(self):
+        super().setUp()
+        self.make(secrets={"REGISTRAR": "old-value"})
+        self.v = vaultline.Vault.open(self.path, PASS)
+
+    def test_metadata_survives_a_round_trip(self):
+        self.v.set_meta("REGISTRAR", origin="https://example.com")
+        self.v.save()
+        again = vaultline.Vault.open(self.path, PASS)
+        self.assertEqual(again.meta["REGISTRAR"]["origin"], "https://example.com")
+        self.assertEqual(again.secrets["REGISTRAR"], "old-value")
+
+    def test_reading_a_value_is_still_one_subscript(self):
+        # The common case is "give me the value". Records must not tax it.
+        self.assertEqual(self.v.secrets["REGISTRAR"], "old-value")
+
+    def test_unknown_metadata_fields_are_refused_not_stored(self):
+        # Metadata that silently does nothing reads as configuration, and
+        # somebody will later rely on it.
+        with self.assertRaises(vaultline.VaultlineError):
+            self.v.set_meta("REGISTRAR", colour="blue")
+
+    def test_metadata_for_an_unknown_secret_is_refused(self):
+        with self.assertRaises(vaultline.VaultlineError):
+            self.v.set_meta("NOT_THERE", origin="https://example.com")
+
+    def test_setting_a_field_to_none_removes_it(self):
+        self.v.set_meta("REGISTRAR", origin="https://example.com", notes="x")
+        self.v.set_meta("REGISTRAR", notes=None)
+        self.assertNotIn("notes", self.v.meta["REGISTRAR"])
+        self.assertIn("origin", self.v.meta["REGISTRAR"])
+
+    def test_an_unknown_field_in_a_stored_record_is_refused_on_open(self):
+        # Dropping it silently would lose whatever a later version meant.
+        self.v.set_meta("REGISTRAR", origin="https://example.com")
+        self.v.save()
+        env = json.loads(self.path.read_text(encoding="utf-8"))
+        doc = {"payload_version": 2,
+               "secrets": {"REGISTRAR": {"value": "x", "mystery": "y"}}}
+        env["payload"] = vaultline._encrypt(json.dumps(doc).encode("utf-8"),
+                                            self.v._master)
+        self.path.write_text(json.dumps(env), encoding="utf-8")
+        with self.assertRaises(vaultline.BadEnvelope):
+            vaultline.Vault.open(self.path, PASS)
+
+    def test_a_record_without_a_value_is_refused(self):
+        env = json.loads(self.path.read_text(encoding="utf-8"))
+        doc = {"payload_version": 2, "secrets": {"REGISTRAR": {"origin": "x"}}}
+        env["payload"] = vaultline._encrypt(json.dumps(doc).encode("utf-8"),
+                                            self.v._master)
+        self.path.write_text(json.dumps(env), encoding="utf-8")
+        with self.assertRaises(vaultline.BadEnvelope):
+            vaultline.Vault.open(self.path, PASS)
+
+    def test_a_version_1_payload_upgrades_on_the_next_save(self):
+        env = json.loads(self.path.read_text(encoding="utf-8"))
+        doc = {"payload_version": 1, "secrets": {"A": "1"}}
+        env["payload"] = vaultline._encrypt(json.dumps(doc).encode("utf-8"),
+                                            self.v._master)
+        self.path.write_text(json.dumps(env), encoding="utf-8")
+
+        old = vaultline.Vault.open(self.path, PASS)
+        self.assertEqual(old.secrets, {"A": "1"})
+        old.set_meta("A", origin="https://example.com")
+        old.save()
+        self.assertEqual(
+            vaultline.Vault.open(self.path, PASS).meta["A"]["origin"],
+            "https://example.com")
+
+    # -- the bridge into planning ----------------------------------------
+
+    def test_credential_carries_no_value(self):
+        """What crosses into plan() must not be able to leak a secret."""
+        self.v.set_meta("REGISTRAR", origin="https://example.com")
+        self.assertNotIn("old-value", json.dumps(self.v.credential("REGISTRAR")))
+
+    def test_credential_reports_what_the_vault_holds(self):
+        self.v.set_meta("REGISTRAR", origin="https://example.com")
+        record = self.v.credential("REGISTRAR")
+        self.assertEqual(record["origin"], "https://example.com")
+        self.assertTrue(record["has_current"])
+        self.assertFalse(record["has_totp"])
+
+    def test_credential_notices_a_matching_totp_seed(self):
+        self.v.secrets["REGISTRAR_TOTP"] = "JBSWY3DPEHPK3PXP"
+        self.assertTrue(self.v.credential("REGISTRAR")["has_totp"])
+
+    def test_credential_feeds_the_planner(self):
+        self.v.set_meta("REGISTRAR", origin="https://example.com")
+        steps = vaultline.plan(a_playbook(), self.v.credential("REGISTRAR"),
+                               candidate="new-one")
+        self.assertEqual(steps[0]["step"], "open")
+
+    def test_a_credential_with_no_origin_cannot_be_planned_against(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.plan(a_playbook(), self.v.credential("REGISTRAR"),
+                           candidate="x")
+
+    # -- the manual root -------------------------------------------------
+
+    def test_roots_are_listed(self):
+        """A credential that authorises rotation cannot be rotated by an API.
+
+        Recorded so it can be seen rather than remembered.
+        """
+        self.v.secrets["ADMIN_TOKEN"] = "t"
+        self.v.set_meta("ADMIN_TOKEN", root=True)
+        self.assertEqual(self.v.roots(), ["ADMIN_TOKEN"])
+
+
 class PayloadTests(VaultCase):
     def test_a_version_0_bare_mapping_still_opens(self):
         # Files written before the payload became a document must not become

@@ -52,6 +52,31 @@ into retiring a working credential.
 a verification budget is enforced and falling back to test the old value spends
 from it. When the budget runs out the tool stops rather than trying once more.
 
+## Secrets carry the facts needed to act on them
+
+A secret is a record, not just a value - though reading one is still a single
+subscript, because almost every use is *give me the value*:
+
+```python
+v.secrets["REGISTRAR"]                              # the value
+v.set_meta("REGISTRAR", origin="https://example.com")
+v.credential("REGISTRAR")                           # what planning gets
+```
+
+`credential()` is the bridge into `plan()`, and it carries **no values** - only
+where the credential lives and what the vault holds for it. A plan built from
+one cannot leak a secret.
+
+Unknown metadata fields are refused rather than stored, on open as well as on
+write. Metadata that silently does nothing reads as configuration, and somebody
+will eventually rely on it.
+
+`root=True` marks a credential that authorises rotating others and therefore
+cannot be rotated by any API. `v.roots()` lists them, so the manual root is
+something you can see rather than remember.
+
+Payload versions 0, 1 and 2 all open, and upgrade on the next save.
+
 ## The first adapter
 
 `GithubSshKeyAdapter` rotates an SSH key on a GitHub account, because those are
@@ -305,7 +330,7 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** Implemented and covered by 138 tests: the envelope, wrappings,
+**Pre-alpha.** Implemented and covered by 152 tests: the envelope, wrappings,
 saving, location safety, the rotation state machine, the clipboard tier, and
 the transport with its fault injection and adapter contract. Not implemented:
 any real adapter, threshold recovery, and any command-line interface.
@@ -315,7 +340,7 @@ Nothing is published to PyPI yet.
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 138 tests
+python vaultline_dev.py             # 152 tests
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
 

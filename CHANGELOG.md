@@ -15,6 +15,11 @@ particular release.
 ## [Unreleased]
 
 ### Added
+- **Payload v2: secrets are records.** Each carries `origin`, `adapter`,
+  `last_verified`, `notes` and `root` beside its value, while `v.secrets[name]`
+  stays a plain value lookup. `credential()` produces what `plan()` needs
+  without any values in it. Unknown fields are refused on read and on write.
+  Versions 0, 1 and 2 all open and upgrade on the next save.
 - **`GithubSshKeyAdapter`**, the first adapter against a published API:
   create-then-revoke over `/user/keys`. A bad authorising token reports `None`
   rather than `False`, because it says nothing about the key being asked
@@ -68,7 +73,7 @@ particular release.
 - scrypt stretching ahead of GPG, with parameters recorded per wrapping.
 - Refusal to operate beneath a folder that looks like a sync root.
 - Verify-then-swap saving, with a `.bak` retained.
-- 138 tests, including one asserting that adding a wrapping leaves the payload
+- 152 tests, including one asserting that adding a wrapping leaves the payload
   byte-identical, and one asserting that an older copy still opens after a
   wrapping has been removed.
 

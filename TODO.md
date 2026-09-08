@@ -21,6 +21,8 @@
       history detection on Windows.
 - [x] **gpg discovery** outside Git Bash, with an actionable error.
 
+- [x] **Payload v2**: per-secret records with origin, so a playbook can be
+      checked against a credential.
 - [x] **First adapter**: GitHub SSH keys, create-then-revoke.
 - [x] **Playbook schema, validator and planner.** The decision layer, testable
       with no browser.
