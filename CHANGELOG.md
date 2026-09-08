@@ -15,6 +15,12 @@ particular release.
 ## [Unreleased]
 
 ### Added
+- **Playbooks**: a declarative format for how to perform an operation at a
+  site, with `validate_playbook()` and a pure `plan()`. The origin comes from
+  the credential rather than the playbook, inventory keys are refused by name,
+  unknown keys are an error rather than ignored, and the vocabulary has no
+  conditionals, loops, waits or retries. Plans carry roles rather than values,
+  so they are safe to log.
 - **A read-only transport.** `Transport(readonly=True)` refuses mutating
   methods, so an adapter can share code between `verify` and `submit` and
   still be unable to change anything while verifying. The escape hatch for
@@ -57,7 +63,7 @@ particular release.
 - scrypt stretching ahead of GPG, with parameters recorded per wrapping.
 - Refusal to operate beneath a folder that looks like a sync root.
 - Verify-then-swap saving, with a `.bak` retained.
-- 93 tests, including one asserting that adding a wrapping leaves the payload
+- 117 tests, including one asserting that adding a wrapping leaves the payload
   byte-identical, and one asserting that an older copy still opens after a
   wrapping has been removed.
 

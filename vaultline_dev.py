@@ -772,6 +772,181 @@ class ContractHasTeethTests(unittest.TestCase):
         self.assertIs(SloppyAdapter().verify("a-token"), False)
 
 
+def a_playbook(**overrides):
+    """A valid playbook, for tests to break in one way at a time."""
+    playbook = {
+        "schema_version": 0,
+        "site": "example.com",
+        "operation": "change_password",
+        "sanction": "unsanctioned",
+        "url": "https://example.com/settings/security",
+        "fields": {
+            "current": {"autocomplete": "current-password"},
+            "new": {"autocomplete": "new-password"},
+            "confirm": {"autocomplete": "new-password", "index": 1},
+        },
+        "submit": {"selector": "button[type=submit]"},
+    }
+    playbook.update(overrides)
+    return playbook
+
+
+A_CREDENTIAL = {"origin": "https://example.com", "has_current": True}
+
+
+class PlaybookValidationTests(unittest.TestCase):
+    """A playbook that loads is one the interpreter fully understood."""
+
+    def test_a_good_playbook_validates(self):
+        self.assertTrue(vaultline.validate_playbook(a_playbook()))
+
+    def test_an_unknown_key_is_an_error_not_ignored(self):
+        """Ignoring unknown keys is the dangerous choice.
+
+        A playbook written for a later schema may carry a constraint. An
+        interpreter that shrugs at it runs something quietly less safe than
+        the playbook claims to be.
+        """
+        with self.assertRaises(vaultline.PlaybookError) as caught:
+            vaultline.validate_playbook(a_playbook(retry=3))
+        self.assertIn("retry", str(caught.exception))
+
+    def test_inventory_keys_are_refused_with_the_reason(self):
+        for key in ("username", "email", "account", "password", "token"):
+            with self.subTest(key=key):
+                with self.assertRaises(vaultline.PlaybookError) as caught:
+                    vaultline.validate_playbook(a_playbook(**{key: "x"}))
+                self.assertIn("inventory", str(caught.exception))
+
+    def test_a_future_schema_version_is_refused(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(
+                a_playbook(schema_version=vaultline.PLAYBOOK_VERSION + 1))
+
+    def test_a_missing_schema_version_is_refused(self):
+        playbook = a_playbook()
+        del playbook["schema_version"]
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(playbook)
+
+    def test_the_url_must_be_https(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(a_playbook(url="http://example.com/x"))
+
+    def test_an_unknown_field_role_is_refused(self):
+        playbook = a_playbook()
+        playbook["fields"]["banner"] = {"selector": ".cookie-banner"}
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(playbook)
+
+    def test_a_locator_needs_a_way_to_find_something(self):
+        playbook = a_playbook()
+        playbook["fields"]["new"] = {"index": 1}
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(playbook)
+
+    def test_a_locator_may_not_carry_unknown_keys(self):
+        playbook = a_playbook()
+        playbook["fields"]["new"] = {"autocomplete": "new-password", "wait": 5}
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(playbook)
+
+    def test_a_challenge_a_playbook_cannot_answer_is_refused(self):
+        # An emailed code needs a human. Declaring it would be a promise the
+        # interpreter cannot keep.
+        with self.assertRaises(vaultline.PlaybookError) as caught:
+            vaultline.validate_playbook(
+                a_playbook(challenges={"email": {"selector": "#code"}}))
+        self.assertIn("human", str(caught.exception))
+
+    def test_a_sanction_must_be_declared(self):
+        playbook = a_playbook()
+        del playbook["sanction"]
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.validate_playbook(playbook)
+
+
+class PlanTests(unittest.TestCase):
+    """Deciding, with no browser and no vault anywhere near it."""
+
+    def test_the_plan_is_the_expected_sequence(self):
+        steps = vaultline.plan(a_playbook(), A_CREDENTIAL, candidate="new-value")
+        self.assertEqual([s["step"] for s in steps],
+                         ["open", "fill", "fill", "fill", "submit"])
+        self.assertEqual([s["role"] for s in steps if s["step"] == "fill"],
+                         ["current", "new", "confirm"])
+
+    def test_the_plan_carries_no_secret_values(self):
+        """A plan should be safe to print, log, or show the operator."""
+        steps = vaultline.plan(a_playbook(), A_CREDENTIAL, candidate="s3cr3t-new")
+        self.assertTrue(vaultline.plan_mentions_no_secrets(steps, "s3cr3t-new"))
+        self.assertNotIn("s3cr3t-new", json.dumps(steps))
+
+    def test_the_plan_is_json_serialisable(self):
+        json.dumps(vaultline.plan(a_playbook(), A_CREDENTIAL, candidate="x"))
+
+    def test_a_playbook_may_not_send_a_secret_to_another_origin(self):
+        """The single most important refusal.
+
+        A hostile or mistaken playbook can waste time. It must not be able to
+        choose where the value goes - the origin comes from the credential.
+        """
+        with self.assertRaises(vaultline.PlaybookError) as caught:
+            vaultline.plan(a_playbook(url="https://evil.example.net/steal"),
+                           A_CREDENTIAL, candidate="x")
+        self.assertIn("does not choose where", str(caught.exception))
+
+    def test_a_credential_with_no_origin_is_refused(self):
+        # Falling back to the playbook's own claim would defeat the check.
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.plan(a_playbook(), {"has_current": True}, candidate="x")
+
+    def test_a_subdomain_is_a_different_origin(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.plan(a_playbook(url="https://accounts.example.com/x"),
+                           A_CREDENTIAL, candidate="x")
+
+    def test_planning_without_a_candidate_is_refused(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.plan(a_playbook(), A_CREDENTIAL)
+
+    def test_planning_without_the_current_value_is_refused(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.plan(a_playbook(), {"origin": "https://example.com"},
+                           candidate="x")
+
+    def test_a_totp_challenge_plans_a_fill_when_a_seed_exists(self):
+        steps = vaultline.plan(
+            a_playbook(challenges={"totp": {"autocomplete": "one-time-code"}}),
+            dict(A_CREDENTIAL, has_totp=True), candidate="x")
+        self.assertIn("totp", [s.get("role") for s in steps])
+
+    def test_a_totp_challenge_hands_over_when_there_is_no_seed(self):
+        # Better to stop than to drive a form about to ask for something we
+        # cannot supply.
+        steps = vaultline.plan(
+            a_playbook(challenges={"totp": {"autocomplete": "one-time-code"}}),
+            A_CREDENTIAL, candidate="x")
+        self.assertIn("handoff", [s["step"] for s in steps])
+
+    def test_no_submit_control_means_hand_over(self):
+        playbook = a_playbook()
+        del playbook["submit"]
+        steps = vaultline.plan(playbook, A_CREDENTIAL, candidate="x")
+        self.assertEqual(steps[-1]["step"], "handoff")
+
+    def test_plan_validates_rather_than_trusting_its_input(self):
+        with self.assertRaises(vaultline.PlaybookError):
+            vaultline.plan(a_playbook(retry=3), A_CREDENTIAL, candidate="x")
+
+    def test_no_step_type_outside_the_closed_vocabulary(self):
+        steps = vaultline.plan(
+            a_playbook(challenges={"totp": {"autocomplete": "one-time-code"}}),
+            A_CREDENTIAL, candidate="x")
+        for step in steps:
+            self.assertIn(step["step"], ("open", "fill", "submit", "handoff"))
+
+
 class MutatingVerifyAdapter(ReferenceAdapter):
     """An adapter whose verify quietly changes something.
 

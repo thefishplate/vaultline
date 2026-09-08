@@ -21,6 +21,8 @@
       history detection on Windows.
 - [x] **gpg discovery** outside Git Bash, with an actionable error.
 
+- [x] **Playbook schema, validator and planner.** The decision layer, testable
+      with no browser.
 - [x] **Read-only transport**, so rehearsing against a real account is a
       property of the object rather than a promise about the code.
 - [x] **Transport, fault injection, adapter contract.** Thirteen failure
@@ -35,6 +37,12 @@
 - [ ] **Rotators for documented services.** Prefer create-then-revoke over
       change-in-place: with tokens the new credential can be verified working
       before the old one dies, and the ambiguous window closes entirely.
+- [ ] **The password-rules parser and candidate generator**, over Apple's
+      MIT-licensed `password-rules.json`. Bracket-aware: character classes
+      contain semicolons and commas, so splitting on them silently produces
+      wrong rules and a candidate the service rejects.
+- [ ] **Executors**: clipboard first, then CDP. Same planner, different back
+      end.
 - [ ] **A command-line interface**: list, get, set, hint, verify, rotate.
 - [ ] **A scheduled live run against drill accounts.** The simulation covers
       the failures we imagined; only a real request notices the twelfth shape.

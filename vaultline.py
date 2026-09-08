@@ -248,6 +248,221 @@ def refuse_sync_root(path, override=False):
 
 
 # ---------------------------------------------------------------------------
+# Playbooks
+#
+# How to perform an operation at a site, expressed as data rather than code.
+# A playbook cannot receive the vault, cannot make an arbitrary request, and
+# cannot execute anything - it can only say things the interpreter already
+# understands. That is the strongest form of the boundary this module keeps
+# drawing, and it is what makes a shared or contributed playbook tenable.
+#
+# Two rules keep it declarative rather than becoming a bad programming
+# language, which is where every automation format ends up:
+#
+#   No conditionals, no loops, no expressions, no waits, no retries. When a
+#   site needs any of those it does not get a playbook - it drops to the tier
+#   where a human does it. Timeouts and retries belong to the interpreter as
+#   policy, so no playbook can express them.
+#
+# And two rules keep it safe:
+#
+#   **A playbook is procedure, never inventory.** It says how to change a
+#   password at a site. It must not name an account, a username, or anything
+#   about which accounts exist - that belongs in the encrypted payload. This is
+#   what lets playbooks be shared while the vault stays private.
+#
+#   **A playbook does not choose where a secret goes.** The origin comes from
+#   the credential record, and planning refuses any playbook whose URL leaves
+#   it. A hostile playbook can waste your time; it cannot exfiltrate.
+#
+# Deciding is separated from doing. plan() is pure: it returns steps, contains
+# no secret values, and is therefore safe to print. An executor resolves the
+# roles to values at the last moment.
+# ---------------------------------------------------------------------------
+
+
+class PlaybookError(VaultlineError):
+    """A playbook is malformed, or cannot be applied to this credential."""
+
+
+#: Bumped when the playbook schema changes. A playbook declares the version it
+#: was written for, and an interpreter meeting a newer one refuses.
+PLAYBOOK_VERSION = 0
+
+PLAYBOOK_OPERATIONS = ("change_password", "rotate_token", "revoke_token")
+
+#: What a field in a form is for. Closed: an unrecognised role is an error,
+#: never something to skip past.
+FIELD_ROLES = ("current", "new", "confirm", "totp")
+
+#: Where a filled value comes from. Note there is no "literal" - a playbook
+#: cannot supply a value, only say which of the vault's values goes where.
+FIELD_SOURCES = {"current": "current_value", "new": "candidate",
+                 "confirm": "candidate", "totp": "totp"}
+
+PLAYBOOK_KEYS = frozenset({
+    "schema_version", "site", "operation", "sanction", "url", "fields",
+    "submit", "challenges", "notes", "last_verified",
+})
+
+#: Keys that would turn a playbook into inventory. Named explicitly so the
+#: refusal has a reason attached rather than being a mysterious rejection.
+INVENTORY_KEYS = frozenset({
+    "username", "user", "email", "account", "login", "password", "secret",
+    "value", "token", "credential",
+})
+
+
+def validate_playbook(raw):
+    """Check a playbook, or say exactly what is wrong with it.
+
+    Unknown keys are an **error**, not something to ignore. An interpreter
+    that shrugs at a key it does not understand will silently drop a
+    constraint written by a later version - and a playbook that is quietly
+    less safe than it claims is worse than one that refuses to load.
+    """
+    if not isinstance(raw, dict):
+        raise PlaybookError("a playbook must be an object")
+
+    version = raw.get("schema_version")
+    if version is None:
+        raise PlaybookError("playbook has no schema_version")
+    if not isinstance(version, int) or version > PLAYBOOK_VERSION:
+        raise PlaybookError(
+            "playbook is schema version %r; this understands up to %d and "
+            "will not guess" % (version, PLAYBOOK_VERSION))
+
+    unknown = set(raw) - PLAYBOOK_KEYS
+    if unknown:
+        inventory = unknown & INVENTORY_KEYS
+        if inventory:
+            raise PlaybookError(
+                "playbook carries %s, which is inventory rather than "
+                "procedure. Accounts live in the vault; a playbook says only "
+                "how to act at a site." % ", ".join(sorted(inventory)))
+        raise PlaybookError("playbook has unknown keys: %s"
+                            % ", ".join(sorted(unknown)))
+
+    for required in ("site", "operation", "url", "fields"):
+        if not raw.get(required):
+            raise PlaybookError("playbook has no %s" % required)
+
+    if raw["operation"] not in PLAYBOOK_OPERATIONS:
+        raise PlaybookError("unknown operation %r; known: %s"
+                            % (raw["operation"], ", ".join(PLAYBOOK_OPERATIONS)))
+    if raw.get("sanction") not in ("documented", "incidental", "unsanctioned"):
+        raise PlaybookError("playbook must declare a sanction")
+    if not str(raw["url"]).startswith("https://"):
+        raise PlaybookError("playbook url must be https")
+
+    fields = raw["fields"]
+    if not isinstance(fields, dict):
+        raise PlaybookError("fields must be an object")
+    for role, locator in fields.items():
+        if role not in FIELD_ROLES:
+            raise PlaybookError("unknown field role %r; known: %s"
+                                % (role, ", ".join(FIELD_ROLES)))
+        _validate_locator(role, locator)
+    if raw.get("submit") is not None:
+        _validate_locator("submit", raw["submit"])
+    for name, locator in (raw.get("challenges") or {}).items():
+        if name not in ("totp",):
+            raise PlaybookError(
+                "challenge %r cannot be answered by a playbook. Email and SMS "
+                "codes need a human, so the plan hands over instead." % name)
+        _validate_locator(name, locator)
+    return raw
+
+
+def _validate_locator(where, locator):
+    if not isinstance(locator, dict) or not locator:
+        raise PlaybookError("%s needs a locator object" % where)
+    unknown = set(locator) - {"autocomplete", "selector", "index"}
+    if unknown:
+        raise PlaybookError("%s locator has unknown keys: %s"
+                            % (where, ", ".join(sorted(unknown))))
+    if not (locator.get("autocomplete") or locator.get("selector")):
+        raise PlaybookError(
+            "%s locator must give an autocomplete token or a selector. The "
+            "autocomplete token is preferred: it is what the site itself "
+            "declares, so it does not rot when the markup is restyled." % where)
+
+
+def origin_of(url):
+    """scheme://host[:port] - what a secret may not be sent outside of."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        raise PlaybookError("cannot read an origin from %r" % url)
+    return "%s://%s" % (parts.scheme, parts.netloc)
+
+
+def plan(playbook, credential, candidate=None):
+    """Turn a playbook plus a credential record into steps.
+
+    Pure: no network, no browser, no vault. The returned steps name *roles*
+    rather than carrying values, so a plan can be printed, logged or shown to
+    the operator without disclosing anything. The executor resolves roles at
+    the last moment.
+
+    `credential` is the vault's record: at least `origin`, and whatever the
+    playbook's fields require.
+    """
+    playbook = validate_playbook(playbook)
+
+    wanted = origin_of(playbook["url"])
+    held = credential.get("origin")
+    if not held:
+        raise PlaybookError(
+            "the credential record has no origin, so there is nothing to check "
+            "the playbook against. Refusing rather than trusting the playbook.")
+    if origin_of(held) != wanted:
+        raise PlaybookError(
+            "playbook would act at %s but the credential belongs to %s. A "
+            "playbook does not choose where a secret goes." % (wanted, origin_of(held)))
+
+    steps = [{"step": "open", "url": playbook["url"]}]
+    for role in FIELD_ROLES:
+        locator = playbook["fields"].get(role)
+        if locator is None:
+            continue
+        source = FIELD_SOURCES[role]
+        if source == "candidate" and candidate is None:
+            raise PlaybookError(
+                "%s needs a candidate value and none was generated" % role)
+        if source == "current_value" and not credential.get("has_current"):
+            raise PlaybookError(
+                "%s needs the current value and the record does not have one" % role)
+        steps.append({"step": "fill", "role": role, "source": source,
+                      "locator": locator})
+
+    for name, locator in sorted((playbook.get("challenges") or {}).items()):
+        if name == "totp" and not credential.get("has_totp"):
+            steps.append({"step": "handoff",
+                          "reason": "the site may ask for a one-time code and "
+                                    "this credential has no TOTP seed"})
+            continue
+        steps.append({"step": "fill", "role": name, "source": name,
+                      "locator": locator, "optional": True})
+
+    if playbook.get("submit"):
+        steps.append({"step": "submit", "locator": playbook["submit"]})
+    else:
+        steps.append({"step": "handoff", "reason": "no submit control declared"})
+    return steps
+
+
+def plan_mentions_no_secrets(steps, *values):
+    """True when no step carries any of *values*. Used by tests and callers
+    that want to log a plan."""
+    import json as _json
+
+    blob = _json.dumps(steps)
+    return not any(v and v in blob for v in values)
+
+
+# ---------------------------------------------------------------------------
 # Transport, and fault injection
 #
 # Adapters talk to services through Transport. The injection points live in

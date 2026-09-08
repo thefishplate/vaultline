@@ -52,6 +52,54 @@ into retiring a working credential.
 a verification budget is enforced and falling back to test the old value spends
 from it. When the budget runs out the tool stops rather than trying once more.
 
+## Playbooks
+
+How to perform an operation at a site, expressed as data rather than code:
+
+```json
+{"schema_version": 0, "site": "example.com", "operation": "change_password",
+ "sanction": "unsanctioned", "url": "https://example.com/settings/security",
+ "fields": {"current": {"autocomplete": "current-password"},
+            "new":     {"autocomplete": "new-password"}},
+ "submit": {"selector": "button[type=submit]"}}
+```
+
+A playbook cannot receive the vault, cannot make an arbitrary request and
+cannot execute anything. It can only say things the interpreter already
+understands, which is what makes a shared or contributed playbook tenable.
+
+**Deciding is separate from doing.** `plan()` is pure - no browser, no network,
+no vault - and returns steps that name *roles* rather than carrying values, so
+a plan is safe to print or log:
+
+```
+{"step": "fill", "role": "new", "source": "candidate",
+ "locator": {"autocomplete": "new-password"}}
+```
+
+Four rules, and each closes something specific:
+
+- **A playbook does not choose where a secret goes.** The origin comes from the
+  credential record; a playbook whose URL leaves it is refused. A hostile
+  playbook can waste your time - it cannot exfiltrate.
+- **A playbook is procedure, never inventory.** No usernames, no account
+  identifiers. That belongs in the encrypted payload, and keeping it out is
+  what lets playbooks be shared while the vault stays private.
+- **Unknown keys are an error, not ignored.** A playbook from a later schema
+  may carry a constraint; an interpreter that shrugs at it runs something
+  quietly less safe than the playbook claims.
+- **No conditionals, no loops, no waits, no retries - ever.** Every automation
+  format grows into a bad programming language; the schema forbids it. Timeouts
+  are interpreter policy, so no playbook can express them. A site needing any
+  of that does not get a playbook - a human does it.
+
+The autocomplete token is preferred over a CSS selector: it is what the site
+itself declares, so it does not rot when the markup is restyled.
+
+Because deciding and doing are separate, the same interpreter serves every
+tier - the clipboard tier is this planner with an executor that copies and
+opens the page instead of typing.
+
 ## Adapters, and how they are tested
 
 An adapter is handed a value and returns a fact: `True`, `False`, or `None`
@@ -231,7 +279,7 @@ without the reader having to know what the defaults were then.
 
 ## Status
 
-**Pre-alpha.** Implemented and covered by 93 tests: the envelope, wrappings,
+**Pre-alpha.** Implemented and covered by 117 tests: the envelope, wrappings,
 saving, location safety, the rotation state machine, the clipboard tier, and
 the transport with its fault injection and adapter contract. Not implemented:
 any real adapter, threshold recovery, and any command-line interface.
@@ -241,7 +289,7 @@ Nothing is published to PyPI yet.
 ## Running the tests
 
 ```
-python vaultline_dev.py             # 93 tests
+python vaultline_dev.py             # 117 tests
 python vaultline_dev.py test --fast # skip the real-KDF case
 ```
 
